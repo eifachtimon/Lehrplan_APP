@@ -1,106 +1,73 @@
-#------------------------------------------------------------Imports------------------------------------------------------------
-from flask import Flask, jsonify, request
-from chroma_lehrplan import load_model_and_tokenizer
-import chromadb
-from flask_cors import CORS  # CORS import
+import json
+import urllib.request
 
-#------------------------------------------------------------ChromaDB------------------------------------------------------------
+SEARCH_URL = "http://127.0.0.1:5000/search"
 
-client = chromadb.PersistentClient()
-client.heartbeat()
+EVAL_QUERIES = [
+    {"query": "Mathematik Bruchrechnen", "expected_fach": "Mathematik"},
+    {"query": "Ich plane eine Mathe Stunde zu Bruchrechnen mit Gruppenarbeit", "expected_fach": "Mathematik"},
+    {"query": "Idee fuer Schwimmunterricht Brustgleichschlag", "expected_fach": "Bewegung und Sport"},
+    {"query": "Unterrichtsidee zu französischer Aussprache", "expected_fach": "Französisch"},
+    {"query": "Lernsequenz zum Koerperausdruck zu Musik", "expected_fach": "Musik"},
+]
 
-def init_collection():
-    try:
-        collection = client.get_or_create_collection(name="Lehrplan_BS")
-        collection_size = collection.count()
-        print(collection_size)
-        return collection
-    except Exception as e:  # Revised exception handling
-        print("Error:", e)
-        collection = load_model_and_tokenizer()
-        return collection
 
-#------------------------------------------------------------App------------------------------------------------------------
+def run_query(query_text):
+    payload = {
+        "query_texts": query_text,
+        "querySchlagwort": "",
+        "n_results": 10,
+        "filters": {"fach": [], "zyklus": []},
+    }
+    request = urllib.request.Request(
+        SEARCH_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    return body.get("metadatas", [[]])[0]
 
-# App
-app = Flask(__name__, static_folder='frontend')
-CORS(app, resources={r"/*": {"origins": "*"}})  # Adjust origins as needed
-    
 
-@app.route('/search', methods=['POST', 'OPTIONS'])
-def search():
-    print('search')
-    
-    # Load or Initiate Collection:
-    collection = init_collection()
-    print("collection: " + collection.name)
-    test = collection.query(
-            query_texts="hallo",
-        )
-    print(test)
-    
-    data = request.json
-    query_texts = data.get('query_texts'),
-    query_schlagwort = data.get('querySchlagwort'),
-    n_results = data.get('n_results')
-    filters = data.get('filters', {})
-    where_conditions = []
+def main():
+    top1_hits = 0
+    top3_hits = 0
 
-    #--- Filter ---
-    
-    # Handle 'fach' filter
-    fach_filters = filters.get('fach', [])
-    if fach_filters:
-        if len(fach_filters) == 1:
-            where_conditions.append({"fach": {"$eq": fach_filters[0]}})
-        else:
-            where_conditions.append({
-                "$or": [{"fach": {"$eq": fach}} for fach in fach_filters]
-            })
+    print("Hybrid Retrieval Evaluation")
+    print("=" * 80)
 
-    # Handle 'zyklus' filter, treated as a string
-    zyklus_filters = filters.get('zyklus', [])
-    if zyklus_filters:
-        if len(zyklus_filters) == 1:
-            where_conditions.append({"zyklus": {"$eq": str(zyklus_filters[0])}})  # Cast zyklus to str
-        else:
-            where_conditions.append({
-                "$or": [{"zyklus": {"$eq": str(zyklus)}} for zyklus in zyklus_filters]  # Cast zyklus to str
-            })
+    for idx, test_case in enumerate(EVAL_QUERIES, start=1):
+        results = run_query(test_case["query"])
+        fach_ranking = [item.get("fach", "N/A") for item in results]
+        expected_fach = test_case["expected_fach"]
 
-    where_clause = {}
-    if len(where_conditions) == 1:
-        where_clause = where_conditions[0]  # If only one condition, no need for $and
-    elif len(where_conditions) > 1:
-        where_clause["$and"] = where_conditions
-       
-    # Ensure n_results is 5 if nothing specified 
-    if n_results is None or n_results == 0:
-         n_results = 5
-    
-    #--- Perform Search ---
+        top1_match = len(fach_ranking) > 0 and fach_ranking[0] == expected_fach
+        top3_match = expected_fach in fach_ranking[:3]
 
-    # Perform the search query with the dynamically constructed where_clause
-    if query_schlagwort[0] == '':
-        results = collection.query(
-            query_texts=query_texts,
-            n_results=n_results,
-            where=where_clause
-        ),
-        
+        if top1_match:
+            top1_hits += 1
+        if top3_match:
+            top3_hits += 1
+
+        print(f"[{idx}] Query: {test_case['query']}")
+        print(f"    Expected fach: {expected_fach}")
+        print(f"    Top 5 fach: {fach_ranking[:5]}")
+        print(f"    Top1 hit: {top1_match}, Top3 hit: {top3_match}")
+
+    total = len(EVAL_QUERIES)
+    top1_score = top1_hits / total
+    top3_score = top3_hits / total
+
+    print("=" * 80)
+    print(f"Top-1 fach accuracy: {top1_score:.2%}")
+    print(f"Top-3 fach accuracy: {top3_score:.2%}")
+
+    if top3_score < 0.80:
+        print("Decision: Add a cross-encoder reranker (top-30 candidates).")
     else:
-        print(query_schlagwort[0])  # Print Schlagwort
-        results = collection.query(
-            query_texts=query_texts,
-            where_document={"$contains": query_schlagwort[0]},  # Suche mit Schlagwort
-            n_results=n_results,
-            where=where_clause
-        )
-    
-    
-    # Return Results to JavaScript
-    return jsonify(results)
+        print("Decision: Keep current hybrid setup and tune weights incrementally.")
 
-if __name__ == '__main__':
-    app.run(debug=True)
-#------------------------------------------------------------End------------------------------------------------------------
+
+if __name__ == "__main__":
+    main()
