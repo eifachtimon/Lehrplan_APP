@@ -3,6 +3,8 @@
 from flask import Flask, jsonify, request, send_from_directory
 from chroma_lehrplan import load_model_and_tokenizer
 import chromadb
+from pathlib import Path
+from flask_cors import CORS
 
 
 #------------------------------------------------------------ChromaDB------------------------------------------------------------
@@ -29,18 +31,20 @@ def init_collection():
 #------------------------------------------------------------App------------------------------------------------------------
 
 #App
-app = Flask(__name__, static_folder='frontend')
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "public"
+app = Flask(__name__, static_folder=str(FRONTEND_DIR))
+CORS(app)
     
 @app.route('/')
 def serve_index():
     #return "main"
     print('homepage')
-    return send_from_directory('frontend', 'index.html')
+    return send_from_directory(str(FRONTEND_DIR), 'index.html')
 
 @app.route('/<path:path>')
 def static_proxy(path):
     # send_static_file verwendet static_folder
-    return send_from_directory('frontend', path)
+    return send_from_directory(str(FRONTEND_DIR), path)
 
 
 
@@ -51,9 +55,9 @@ def search():
     # Load or Initiate Collection:
     collection = init_collection()
     
-    data = request.json
-    query_texts = data.get('query_texts'),
-    query_schlagwort = data.get('querySchlagwort'),
+    data = request.json or {}
+    query_texts = data.get('query_texts', '')
+    query_schlagwort = data.get('querySchlagwort', '')
     n_results = data.get('n_results')
     filters = data.get('filters', {})
     where_conditions = []
@@ -89,7 +93,7 @@ def search():
        
     #Ensure n_results is 5 if nothing specified 
     if n_results is None or n_results == 0:
-         n_results = 5
+        n_results = 10
     
     
     
@@ -97,22 +101,26 @@ def search():
 
     # Perform the search query with the dynamically constructed where_clause => Schlagwort
     #Wenn kein Schlagwort eingegeben wurde
-    if query_schlagwort[0] == '':
-        results = collection.query(
-            query_texts=query_texts,
-            n_results=n_results,
-            where=where_clause),
+    if query_schlagwort == '':
+        query_kwargs = {
+            "query_texts": [query_texts],
+            "n_results": n_results,
+        }
+        if where_clause:
+            query_kwargs["where"] = where_clause
+        results = collection.query(**query_kwargs),
         results = results[0]
     #Suche mit Schlagwort
     else:
-        print(query_schlagwort[0]) #Print Schlagwort
-        results = collection.query(
-            query_texts=query_texts,
-            where_document={"$contains":query_schlagwort[0]}, #Suche mit Schlagwort
-            n_results=n_results,
-            where=where_clause
-        
-        )
+        print(query_schlagwort) #Print Schlagwort
+        query_kwargs = {
+            "query_texts": [query_texts],
+            "where_document": {"$contains": query_schlagwort}, #Suche mit Schlagwort
+            "n_results": n_results,
+        }
+        if where_clause:
+            query_kwargs["where"] = where_clause
+        results = collection.query(**query_kwargs)
     
     #--- Return Results ---
     
