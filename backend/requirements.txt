@@ -1,0 +1,6 @@
+flask
+flask-cors
+chromadb
+torch
+transformers
+gunicorn

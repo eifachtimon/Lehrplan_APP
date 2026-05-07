@@ -6,6 +6,7 @@ import chromadb
 from pathlib import Path
 from flask_cors import CORS
 import re
+import os
 
 
 #------------------------------------------------------------ChromaDB------------------------------------------------------------
@@ -18,23 +19,46 @@ client = chromadb.PersistentClient()
 client.heartbeat()
 
 FACH_ALIASES = {
-    "Mathematik": ["mathematik", "mathe", "bruch", "brueche", "brüche", "bruchrechnen", "geometrie"],
+    "Mathematik": ["mathematik", "mathe", "bruch", "brueche", "brüche", "bruchrechnen", "geometrie", "loesungsweg", "loesungswege", "strategie", "strategien", "modellieren", "begruenden", "begruendet"],
     "Deutsch": ["deutsch", "grammatik", "lesen", "schreiben"],
     "Französisch": ["französisch", "franzoesisch", "franzoesisch", "franz"],
     "Englisch": ["englisch", "english"],
-    "Bewegung und Sport": ["sport", "bewegung", "schwimmen", "turnen"],
+    "Bewegung und Sport": ["sport", "bewegung", "schwimmen", "schwimmunterricht", "brustgleichschlag", "turnen"],
+    "Räume, Zeiten, Gesellschaften (mit Geografie, Geschichte)": ["rzg", "geografie", "geschichte", "raum", "zeiten", "quellen", "positionen", "abwaegen", "abwaegen", "einordnen", "urteilen"],
+    "Wirtschaft, Arbeit, Haushalt (mit Hauswirtschaft)": ["wah", "wirtschaft", "haushalt", "konsum", "nachhaltig", "nachhaltigem"],
+    "Natur und Technik (mit Physik, Chemie, Biologie)": ["nt", "natur und technik", "physik", "chemie", "biologie"],
+    "Musik": ["musik", "rhythmus", "klang", "instrument"],
 }
 
 QUERY_SYNONYMS = {
     "bruchrechnen": ["bruch", "brüche", "brueche", "nenner", "zähler", "zaehler", "bruchzahl"],
     "mathe": ["mathematik"],
     "unterrichtsidee": ["unterricht", "lernaufgabe", "sequenz", "projekt"],
+    "gruppenarbeit": ["teamarbeit", "kooperativ", "partnerarbeit"],
+    "bewerten": ["beurteilen", "einschaetzen", "einschätzen", "reflektieren"],
+    "analysieren": ["untersuchen", "auswerten", "strukturieren"],
+    "argumentieren": ["begruenden", "begründen", "diskutieren", "eroertern", "erörtern"],
 }
 
 STOPWORDS = {
     "ich", "plane", "eine", "einen", "einer", "zu", "mit", "und", "oder", "fuer", "für",
     "das", "der", "die", "den", "dem", "des", "im", "in", "an", "auf", "von", "am",
     "stunde", "unterricht", "gruppenarbeit",
+    "lektion", "lektionen", "doppelstunde", "klassen", "klasse",
+}
+
+INTENT_HINTS = {
+    "kommunikation": ["argumentieren", "diskutieren", "praesentieren", "präsentieren", "erklaeren", "erklären"],
+    "methodik": ["gruppenarbeit", "teamarbeit", "stationenlernen", "projekt", "rollenspiel"],
+    "analyse": ["analysieren", "bewerten", "beurteilen", "reflektieren", "quellen"],
+}
+
+SEMANTIC_CONCEPTS = {
+    "beurteilen": ["bewerten", "reflektieren", "kritisch einordnen", "urteilen"],
+    "analysieren": ["untersuchen", "auswerten", "strukturieren", "zusammenhaenge erkennen"],
+    "argumentieren": ["begruenden", "standpunkt vertreten", "diskutieren", "schlussfolgern"],
+    "kooperieren": ["gruppenarbeit", "teamarbeit", "partnerarbeit", "gemeinsam loesen"],
+    "problemloesen": ["strategie entwickeln", "loesungsweg planen", "modellieren", "anwenden"],
 }
 
 def init_collection():
@@ -82,6 +106,139 @@ def detect_fach_signals(query_text):
     return signals
 
 
+def detect_zyklus_from_query(query_text):
+    normalized_query = normalize_text(query_text)
+    if "zyklus 1" in normalized_query or re.search(r"\b[1-2]\.\s*klasse\b", normalized_query):
+        return {"1"}
+    if "zyklus 2" in normalized_query or re.search(r"\b[3-6]\.\s*klasse\b", normalized_query):
+        return {"2"}
+    if "zyklus 3" in normalized_query or re.search(r"\b[7-9]\.\s*klasse\b", normalized_query):
+        return {"3"}
+    return set()
+
+
+def split_query_into_intents(query_text):
+    normalized = re.sub(r"\s+", " ", query_text or "").strip()
+    if not normalized:
+        return []
+    parts = re.split(r"\b(?:und|sowie|mit|plus|,|;)\b", normalized, flags=re.IGNORECASE)
+    cleaned = []
+    for part in parts:
+        item = part.strip(" ,;")
+        if len(item) >= 4:
+            cleaned.append(item)
+    return cleaned[:8]
+
+
+def build_query_variants(query_text, query_schlagwort):
+    base_query = f"{query_text} {query_schlagwort}".strip() if query_schlagwort else query_text
+    intent_queries = split_query_into_intents(base_query)
+    variants = [base_query] + intent_queries
+    deduplicated = []
+    seen = set()
+    for variant in variants:
+        key = normalize_text(variant)
+        if key and key not in seen:
+            deduplicated.append(variant)
+            seen.add(key)
+    return deduplicated[:10]
+
+
+def build_semantic_variants(query_text, fach_signals, intent_signals):
+    base = re.sub(r"\s+", " ", query_text or "").strip()
+    if not base:
+        return []
+
+    prompts = [f"Kompetenzbeschreibung: {base}"]
+    for fach in sorted(fach_signals):
+        prompts.append(f"Kompetenzen im Fach {fach}: {base}")
+
+    for intent in sorted(intent_signals):
+        aliases = INTENT_HINTS.get(intent, [])
+        if aliases:
+            prompts.append(f"{base}; Fokus: {' '.join(aliases[:3])}")
+
+    normalized_query = normalize_text(query_text)
+    for concept, aliases in SEMANTIC_CONCEPTS.items():
+        if concept in normalized_query or any(alias in normalized_query for alias in aliases):
+            prompts.append(f"{base}; Kompetenzverb: {concept}; Synonyme: {' '.join(aliases[:3])}")
+
+    deduplicated = []
+    seen = set()
+    for prompt in prompts:
+        key = normalize_text(prompt)
+        if key and key not in seen:
+            deduplicated.append(prompt)
+            seen.add(key)
+    return deduplicated[:8]
+
+
+def detect_intent_signals(query_text):
+    normalized_query = normalize_text(query_text)
+    hits = set()
+    for intent, aliases in INTENT_HINTS.items():
+        if any(alias in normalized_query for alias in aliases):
+            hits.add(intent)
+    return hits
+
+
+def classify_query_profile(query_text, query_tokens, intent_signals):
+    normalized_query = normalize_text(query_text)
+    token_count = len(query_tokens)
+    has_grade_hint = bool(re.search(r"\b(?:[1-9]\.\s*klasse|zyklus\s*[1-3])\b", normalized_query))
+    has_planning_hint = any(
+        hint in normalized_query
+        for hint in ["planung", "lektion", "lernsequenz", "projekt", "unterrichtsidee", "lernarrangement"]
+    )
+    is_complex = token_count >= 8 or len(intent_signals) >= 2 or (has_planning_hint and has_grade_hint)
+
+    if is_complex:
+        return "planning_complex"
+    if token_count <= 3 and not intent_signals:
+        return "lookup_short"
+    return "standard"
+
+
+def get_score_weights(query_profile):
+    if query_profile == "planning_complex":
+        return {
+            "vector": 0.27,
+            "keyword": 0.19,
+            "metadata": 0.24,
+            "variant": 0.10,
+            "rrf": 0.20,
+            "semantic_weight": 0.95,
+        }
+    if query_profile == "lookup_short":
+        return {
+            "vector": 0.30,
+            "keyword": 0.30,
+            "metadata": 0.24,
+            "variant": 0.06,
+            "rrf": 0.10,
+            "semantic_weight": 0.45,
+        }
+    return {
+        "vector": 0.31,
+        "keyword": 0.23,
+        "metadata": 0.18,
+        "variant": 0.08,
+        "rrf": 0.20,
+        "semantic_weight": 0.75,
+    }
+
+
+def resolve_n_results(requested_n_results, query_profile):
+    if isinstance(requested_n_results, int) and requested_n_results > 0:
+        return min(requested_n_results, 25)
+
+    if query_profile == "planning_complex":
+        return 14
+    if query_profile == "lookup_short":
+        return 8
+    return 10
+
+
 def build_where_clause(filters):
     where_conditions = []
 
@@ -112,7 +269,7 @@ def build_where_clause(filters):
     return None
 
 
-def upsert_candidate(candidate_map, ids, documents, metadatas, distances, source, token=None):
+def upsert_candidate(candidate_map, ids, documents, metadatas, distances, source, token=None, variant=None, source_weight=1.0):
     for idx, doc_id in enumerate(ids):
         entry = candidate_map.setdefault(
             doc_id,
@@ -123,6 +280,8 @@ def upsert_candidate(candidate_map, ids, documents, metadatas, distances, source
                 "best_distance": None,
                 "keyword_hits": set(),
                 "sources": set(),
+                "query_variants": set(),
+                "rrf_score": 0.0,
             },
         )
 
@@ -134,6 +293,11 @@ def upsert_candidate(candidate_map, ids, documents, metadatas, distances, source
         if source == "keyword" and token:
             entry["keyword_hits"].add(token)
 
+        if variant:
+            entry["query_variants"].add(variant)
+
+        rank = idx + 1
+        entry["rrf_score"] += source_weight / (60.0 + rank)
         entry["sources"].add(source)
 
 
@@ -144,10 +308,8 @@ def vector_retrieve(collection, query_text, where_clause, limit):
     return collection.query(**query_kwargs)
 
 
-def keyword_retrieve(collection, query_text, query_tokens, where_clause, per_token_limit):
-    keyword_results = []
+def keyword_retrieve_and_upsert(collection, query_text, query_tokens, where_clause, per_token_limit, candidate_map, variant):
     unique_tokens = query_tokens[:8]
-
     full_query_kwargs = {
         "query_texts": [query_text],
         "where_document": {"$contains": query_text},
@@ -155,7 +317,18 @@ def keyword_retrieve(collection, query_text, query_tokens, where_clause, per_tok
     }
     if where_clause:
         full_query_kwargs["where"] = where_clause
-    keyword_results.append(("__full_query__", collection.query(**full_query_kwargs)))
+    full_result = collection.query(**full_query_kwargs)
+    upsert_candidate(
+        candidate_map,
+        full_result.get("ids", [[]])[0],
+        full_result.get("documents", [[]])[0],
+        full_result.get("metadatas", [[]])[0],
+        full_result.get("distances", [[]])[0],
+        "keyword",
+        token="__full_query__",
+        variant=variant,
+        source_weight=1.15,
+    )
 
     for token in unique_tokens:
         query_kwargs = {
@@ -165,44 +338,57 @@ def keyword_retrieve(collection, query_text, query_tokens, where_clause, per_tok
         }
         if where_clause:
             query_kwargs["where"] = where_clause
-        keyword_results.append((token, collection.query(**query_kwargs)))
+        result = collection.query(**query_kwargs)
+        upsert_candidate(
+            candidate_map,
+            result.get("ids", [[]])[0],
+            result.get("documents", [[]])[0],
+            result.get("metadatas", [[]])[0],
+            result.get("distances", [[]])[0],
+            "keyword",
+            token=token,
+            variant=variant,
+            source_weight=1.0,
+        )
 
-    return keyword_results
 
-
-def merge_and_score(vector_results, keyword_results, query_tokens, fach_signals):
-    candidate_map = {}
-
-    vector_ids = vector_results.get("ids", [[]])[0]
-    vector_documents = vector_results.get("documents", [[]])[0]
-    vector_metadatas = vector_results.get("metadatas", [[]])[0]
-    vector_distances = vector_results.get("distances", [[]])[0]
-    upsert_candidate(candidate_map, vector_ids, vector_documents, vector_metadatas, vector_distances, "vector")
-
-    for token, result in keyword_results:
-        ids = result.get("ids", [[]])[0]
-        documents = result.get("documents", [[]])[0]
-        metadatas = result.get("metadatas", [[]])[0]
-        distances = result.get("distances", [[]])[0]
-        upsert_candidate(candidate_map, ids, documents, metadatas, distances, "keyword", token=token)
-
+def score_candidates(candidate_map, query_tokens, fach_signals, intent_signals, weights):
     scored_items = []
     token_count = max(len(query_tokens), 1)
+    intent_count = max(len(intent_signals), 1)
 
     for item in candidate_map.values():
         distance = item["best_distance"] if item["best_distance"] is not None else 2.5
         vector_score = 1.0 / (1.0 + max(distance, 0.0))
         keyword_score = min(len(item["keyword_hits"]) / token_count, 1.0)
+        variant_score = min(len(item["query_variants"]) / 4.0, 1.0)
+        rrf_score = min(item.get("rrf_score", 0.0) * 3.5, 1.0)
 
         metadata_score = 0.0
         fach = item["metadata"].get("fach")
         if fach_signals and fach in fach_signals:
-            metadata_score += 1.0
+            metadata_score += 1.2
+        elif fach_signals:
+            metadata_score -= 0.4
+
+        query_text_blob = normalize_text(item["document"])
+        if intent_signals:
+            matched_intents = sum(
+                1 for intent, aliases in INTENT_HINTS.items()
+                if intent in intent_signals and any(alias in query_text_blob for alias in aliases)
+            )
+            metadata_score += min(matched_intents / intent_count, 1.0) * 0.7
 
         if "__full_query__" in item["keyword_hits"]:
             keyword_score = min(keyword_score + 0.25, 1.0)
 
-        final_score = (0.45 * vector_score) + (0.25 * keyword_score) + (0.30 * metadata_score)
+        final_score = (
+            (weights["vector"] * vector_score)
+            + (weights["keyword"] * keyword_score)
+            + (weights["metadata"] * metadata_score)
+            + (weights["variant"] * variant_score)
+            + (weights["rrf"] * rrf_score)
+        )
         item["final_score"] = final_score
         scored_items.append(item)
 
@@ -210,11 +396,55 @@ def merge_and_score(vector_results, keyword_results, query_tokens, fach_signals)
     return scored_items
 
 
-def format_response(scored_items, n_results):
-    top_items = scored_items[:n_results]
+def diversify_by_fach(scored_items, n_results):
+    if n_results <= 0:
+        return []
+
+    selected = []
+    fach_counts = {}
+
+    for item in scored_items:
+        if len(selected) >= n_results:
+            break
+
+        fach = item["metadata"].get("fach", "__unknown__")
+        current_count = fach_counts.get(fach, 0)
+        # Keep the first pass balanced: max 2 items per fach.
+        if current_count >= 2:
+            continue
+
+        selected.append(item)
+        fach_counts[fach] = current_count + 1
+
+    if len(selected) >= n_results:
+        return selected[:n_results]
+
+    selected_ids = {item["id"] for item in selected}
+    for item in scored_items:
+        if len(selected) >= n_results:
+            break
+        if item["id"] in selected_ids:
+            continue
+        selected.append(item)
+
+    return selected[:n_results]
+
+
+def format_response(scored_items, n_results, query_profile):
+    top_items = diversify_by_fach(scored_items, n_results)
     return {
         "documents": [[item["document"] for item in top_items]],
-        "metadatas": [[item["metadata"] for item in top_items]],
+        "metadatas": [[
+            {
+                **item["metadata"],
+                "_score": round(item["final_score"], 5),
+                "_match_sources": sorted(item["sources"]),
+                "_query_variant_hits": len(item["query_variants"]),
+                "_keyword_hits": len(item["keyword_hits"]),
+                "_query_profile": query_profile,
+            }
+            for item in top_items
+        ]],
         "ids": [[item["id"] for item in top_items]],
         "distances": [[item["best_distance"] if item["best_distance"] is not None else 1.0 for item in top_items]],
     }
@@ -224,7 +454,11 @@ def format_response(scored_items, n_results):
 #App
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend" / "public"
 app = Flask(__name__, static_folder=str(FRONTEND_DIR))
-CORS(app)
+cors_origins_raw = os.getenv("CORS_ORIGINS", "*").strip()
+if cors_origins_raw == "*":
+    CORS(app)
+else:
+    CORS(app, resources={r"/*": {"origins": [origin.strip() for origin in cors_origins_raw.split(",") if origin.strip()]}})
     
 @app.route('/')
 def serve_index():
@@ -237,6 +471,9 @@ def static_proxy(path):
     # send_static_file verwendet static_folder
     return send_from_directory(str(FRONTEND_DIR), path)
 
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"})
 
 
 
@@ -247,31 +484,71 @@ def search():
     data = request.json or {}
     query_text = (data.get('query_texts') or '').strip()
     query_schlagwort = (data.get('querySchlagwort') or '').strip()
-    n_results = data.get('n_results') or 10
+    requested_n_results = data.get('n_results')
     filters = data.get('filters', {})
 
     if not query_text:
         return jsonify({"documents": [[]], "metadatas": [[]], "ids": [[]], "distances": [[]]})
 
+    inferred_zyklus = detect_zyklus_from_query(query_text)
+    if inferred_zyklus and not filters.get("zyklus"):
+        filters = {**filters, "zyklus": sorted(inferred_zyklus)}
+
     where_clause = build_where_clause(filters)
-    query_tokens = tokenize_query(query_text)
+    query_tokens = tokenize_query(f"{query_text} {query_schlagwort}".strip())
     fach_signals = detect_fach_signals(query_text)
+    intent_signals = detect_intent_signals(query_text)
+    query_profile = classify_query_profile(query_text, query_tokens, intent_signals)
+    weights = get_score_weights(query_profile)
+    n_results = resolve_n_results(requested_n_results, query_profile)
+    query_variants = build_query_variants(query_text, query_schlagwort)
+    semantic_variants = build_semantic_variants(query_text, fach_signals, intent_signals)
 
-    vector_results = vector_retrieve(collection, query_text, where_clause, limit=max(40, n_results * 4))
-    keyword_seed = f"{query_text} {query_schlagwort}".strip() if query_schlagwort else query_text
-    keyword_results = keyword_retrieve(
-        collection,
-        keyword_seed,
-        query_tokens,
-        where_clause,
-        per_token_limit=max(10, n_results * 2),
-    )
+    candidate_map = {}
+    vector_limit = max(40, n_results * 4)
+    keyword_limit = max(10, n_results * 2)
 
-    scored_items = merge_and_score(vector_results, keyword_results, query_tokens, fach_signals)
-    response = format_response(scored_items, n_results)
+    for variant in query_variants:
+        vector_results = vector_retrieve(collection, variant, where_clause, limit=vector_limit)
+        upsert_candidate(
+            candidate_map,
+            vector_results.get("ids", [[]])[0],
+            vector_results.get("documents", [[]])[0],
+            vector_results.get("metadatas", [[]])[0],
+            vector_results.get("distances", [[]])[0],
+            "vector",
+            variant=variant,
+            source_weight=1.0,
+        )
+        keyword_retrieve_and_upsert(
+            collection,
+            variant,
+            tokenize_query(variant),
+            where_clause,
+            per_token_limit=keyword_limit,
+            candidate_map=candidate_map,
+            variant=variant,
+        )
+
+    for semantic_variant in semantic_variants:
+        semantic_vector_results = vector_retrieve(collection, semantic_variant, where_clause, limit=max(25, n_results * 3))
+        upsert_candidate(
+            candidate_map,
+            semantic_vector_results.get("ids", [[]])[0],
+            semantic_vector_results.get("documents", [[]])[0],
+            semantic_vector_results.get("metadatas", [[]])[0],
+            semantic_vector_results.get("distances", [[]])[0],
+            "semantic_vector",
+            variant=semantic_variant,
+            source_weight=weights["semantic_weight"],
+        )
+
+    scored_items = score_candidates(candidate_map, query_tokens, fach_signals, intent_signals, weights)
+    response = format_response(scored_items, n_results, query_profile)
+    response["meta"] = {"n_results_used": n_results, "query_profile": query_profile}
     return jsonify(response)
 
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
 #------------------------------------------------------------End------------------------------------------------------------
