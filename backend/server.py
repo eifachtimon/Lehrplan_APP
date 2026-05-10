@@ -715,5 +715,6 @@ def static_proxy(path):
 
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
+    # Standard 5001: auf macOS blockiert AirPlay-Empfänger oft Port 5000.
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5001")), debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
 #------------------------------------------------------------End------------------------------------------------------------

@@ -21,7 +21,8 @@
             "module": "flask",
             "env": {
                 "FLASK_APP": "backend/server.py",
-                "FLASK_DEBUG": "1"
+                "FLASK_DEBUG": "1",
+                "FLASK_RUN_PORT": "5001"
             },
             "args": [
                 "run",

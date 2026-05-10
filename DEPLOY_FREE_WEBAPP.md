@@ -38,5 +38,5 @@ Bei mehreren Domains:
 
 - Der erste Request auf Render Free kann durch Cold Start langsam sein.
 - Das Modell wird beim Start geladen; der erste Suchaufruf dauert deshalb länger.
-- Für lokale Entwicklung bleibt ohne `.env` der Default:
-  - `http://127.0.0.1:5000`
+- Für lokale Entwicklung bleibt ohne `.env` der Default (AirPlay auf dem Mac nutzt oft Port 5000):
+  - Backend: `http://127.0.0.1:5001`
