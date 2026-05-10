@@ -7,6 +7,7 @@ from pathlib import Path
 from flask_cors import CORS
 import re
 import os
+import json
 
 
 #------------------------------------------------------------ChromaDB------------------------------------------------------------
@@ -432,22 +433,154 @@ def diversify_by_fach(scored_items, n_results):
 
 def format_response(scored_items, n_results, query_profile):
     top_items = diversify_by_fach(scored_items, n_results)
+    metadata_rows = []
+    for item in top_items:
+        competency_chain = lookup_competency_chain(item["id"])
+        metadata_rows.append({
+            **item["metadata"],
+            "_score": round(item["final_score"], 5),
+            "_match_sources": sorted(item["sources"]),
+            "_query_variant_hits": len(item["query_variants"]),
+            "_keyword_hits": len(item["keyword_hits"]),
+            "_query_profile": query_profile,
+            "_competency_chain": competency_chain,
+        })
     return {
         "documents": [[item["document"] for item in top_items]],
-        "metadatas": [[
-            {
-                **item["metadata"],
-                "_score": round(item["final_score"], 5),
-                "_match_sources": sorted(item["sources"]),
-                "_query_variant_hits": len(item["query_variants"]),
-                "_keyword_hits": len(item["keyword_hits"]),
-                "_query_profile": query_profile,
-            }
-            for item in top_items
-        ]],
+        "metadatas": [metadata_rows],
         "ids": [[item["id"] for item in top_items]],
         "distances": [[item["best_distance"] if item["best_distance"] is not None else 1.0 for item in top_items]],
     }
+
+# --- Kompetenz-Aufbaukette (Vorgänger / aktuell / Nachfolger) -----------------
+
+LEHRPLAN_JSON_PATH = Path(
+    os.getenv("LEHRPLAN_JSON_PATH", str(Path(__file__).resolve().parent / "Lehrplan21.json"))
+)
+CHAIN_KEY_FIELDS = ("fb_id", "f_id", "kb_id", "ha_id", "k_id", "aufbau")
+
+_chain_group_rows_cache = {}
+_lehrplan_json_rows = None
+
+
+def _normalize_uid(uid):
+    if uid is None:
+        return None
+    text = str(uid).strip()
+    return text if text else None
+
+
+def _format_chain_item(item):
+    if not item:
+        return None
+    return {
+        "uid": item.get("uid"),
+        "code": item.get("code"),
+        "text": item.get("text"),
+        "zyklus": item.get("zyklus"),
+        "fach": item.get("fach"),
+        "themenbereich": item.get("themenbereich"),
+        "url": item.get("url"),
+        "folge_in_aufbaute": item.get("folge_in_aufbaute"),
+    }
+
+
+def _load_lehrplan_rows():
+    """Rohe Zeilen aus Lehrplan21.json (optional Cache für Fallback)."""
+    global _lehrplan_json_rows
+    if _lehrplan_json_rows is not None:
+        return _lehrplan_json_rows
+
+    if not LEHRPLAN_JSON_PATH.is_file():
+        _lehrplan_json_rows = []
+        return _lehrplan_json_rows
+
+    with open(LEHRPLAN_JSON_PATH, encoding="utf-8") as json_file:
+        _lehrplan_json_rows = json.load(json_file)
+
+    return _lehrplan_json_rows
+
+
+def _dedupe_chain_rows(rows):
+    """Lehrplan-Daten haben dieselbe uid mehrfach (Varianten); für die Kette nur erste Zeile pro uid."""
+    rows.sort(
+        key=lambda row: (
+            int(str(row.get("folge_in_aufbaute") or "0")),
+            str(row.get("uid") or ""),
+        )
+    )
+    deduped = []
+    seen_uid = set()
+    for row in rows:
+        uid_key = _normalize_uid(row.get("uid"))
+        if not uid_key or uid_key in seen_uid:
+            continue
+        seen_uid.add(uid_key)
+        deduped.append(row)
+    return deduped
+
+
+def _deduped_group_rows_for_key(group_key):
+    """Sortierte, nach uid deduplizierte Zeilen einer Aufbau-Gruppe (mit Cache pro Gruppe)."""
+    global _chain_group_rows_cache
+    if group_key in _chain_group_rows_cache:
+        return _chain_group_rows_cache[group_key]
+
+    json_data = _load_lehrplan_rows()
+    if not json_data:
+        _chain_group_rows_cache[group_key] = []
+        return []
+
+    group_rows = [
+        row
+        for row in json_data
+        if row.get("strukturtyp") == "Kompetenzstufe"
+        and tuple(str(row.get(k, "") or "") for k in CHAIN_KEY_FIELDS) == group_key
+    ]
+    deduped = _dedupe_chain_rows(group_rows)
+    _chain_group_rows_cache[group_key] = deduped
+    return deduped
+
+
+def lookup_competency_chain(uid):
+    """Vorgänger, aktuelle Stufe, Nachfolger und volle Kette (für Navigation ohne zweiten Request)."""
+    normalized = _normalize_uid(uid)
+    if not normalized:
+        return None
+
+    json_data = _load_lehrplan_rows()
+    if not json_data:
+        return None
+
+    target_row = None
+    for row in json_data:
+        if row.get("strukturtyp") != "Kompetenzstufe":
+            continue
+        if _normalize_uid(row.get("uid")) == normalized:
+            target_row = row
+            break
+
+    if not target_row:
+        return None
+
+    group_key = tuple(str(target_row.get(k, "") or "") for k in CHAIN_KEY_FIELDS)
+    rows = _deduped_group_rows_for_key(group_key)
+    if not rows:
+        return None
+
+    index_map = {_normalize_uid(r.get("uid")): i for i, r in enumerate(rows)}
+    pos = index_map.get(normalized)
+    if pos is None:
+        return None
+
+    full_formatted = [_format_chain_item(r) for r in rows]
+    return {
+        "previous": full_formatted[pos - 1] if pos > 0 else None,
+        "current": full_formatted[pos],
+        "next": full_formatted[pos + 1] if pos < len(full_formatted) - 1 else None,
+        "full_chain": full_formatted,
+    }
+
 
 #------------------------------------------------------------App------------------------------------------------------------
 
@@ -466,15 +599,18 @@ def serve_index():
     print('homepage')
     return send_from_directory(str(FRONTEND_DIR), 'index.html')
 
-@app.route('/<path:path>')
-def static_proxy(path):
-    # send_static_file verwendet static_folder
-    return send_from_directory(str(FRONTEND_DIR), path)
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "ok"})
 
+
+@app.route('/competency-chain/<uid>', methods=['GET'])
+def competency_chain(uid):
+    payload = lookup_competency_chain(uid)
+    if payload is None:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(payload)
 
 
 @app.route('/search', methods=['POST'])
@@ -547,6 +683,12 @@ def search():
     response = format_response(scored_items, n_results, query_profile)
     response["meta"] = {"n_results_used": n_results, "query_profile": query_profile}
     return jsonify(response)
+
+
+@app.route('/<path:path>')
+def static_proxy(path):
+    # send_static_file verwendet static_folder
+    return send_from_directory(str(FRONTEND_DIR), path)
 
 
 if __name__ == '__main__':
