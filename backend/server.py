@@ -522,6 +522,33 @@ def _deduped_group_rows_for_key(group_key):
     return deduped
 
 
+def _minimal_chain_from_chroma(normalized_uid):
+    """Wenn Lehrplan21.json fehlt oder UID dort nicht vorkommt: nur aktuelle Stufe aus Chroma."""
+    try:
+        collection = init_collection()
+        result = collection.get(ids=[normalized_uid], include=["metadatas", "documents"])
+        ids_out = result.get("ids") or []
+        if not ids_out:
+            return None
+        meta = (result.get("metadatas") or [None])[0] or {}
+        docs = result.get("documents") or []
+        text_body = docs[0] if docs else ""
+        synthetic = {**meta, "text": text_body}
+        item = _format_chain_item(synthetic)
+        if not item or not item.get("uid"):
+            return None
+        return {
+            "previous": None,
+            "current": item,
+            "next": None,
+            "full_chain": [item],
+            "_chain_partial": True,
+        }
+    except Exception as exc:
+        print(f"Aufbau-Kette Chroma-Fallback fehlgeschlagen ({normalized_uid}): {exc}")
+        return None
+
+
 def lookup_competency_chain(uid):
     """Vorgänger, aktuelle Stufe, Nachfolger und volle Kette (für Navigation ohne zweiten Request)."""
     normalized = _normalize_uid(uid)
@@ -529,37 +556,31 @@ def lookup_competency_chain(uid):
         return None
 
     json_data = _load_lehrplan_rows()
-    if not json_data:
-        return None
+    if json_data:
+        target_row = None
+        for row in json_data:
+            if row.get("strukturtyp") != "Kompetenzstufe":
+                continue
+            if _normalize_uid(row.get("uid")) == normalized:
+                target_row = row
+                break
 
-    target_row = None
-    for row in json_data:
-        if row.get("strukturtyp") != "Kompetenzstufe":
-            continue
-        if _normalize_uid(row.get("uid")) == normalized:
-            target_row = row
-            break
+        if target_row:
+            group_key = tuple(str(target_row.get(k, "") or "") for k in CHAIN_KEY_FIELDS)
+            rows = _deduped_group_rows_for_key(group_key)
+            if rows:
+                index_map = {_normalize_uid(r.get("uid")): i for i, r in enumerate(rows)}
+                pos = index_map.get(normalized)
+                if pos is not None:
+                    full_formatted = [_format_chain_item(r) for r in rows]
+                    return {
+                        "previous": full_formatted[pos - 1] if pos > 0 else None,
+                        "current": full_formatted[pos],
+                        "next": full_formatted[pos + 1] if pos < len(full_formatted) - 1 else None,
+                        "full_chain": full_formatted,
+                    }
 
-    if not target_row:
-        return None
-
-    group_key = tuple(str(target_row.get(k, "") or "") for k in CHAIN_KEY_FIELDS)
-    rows = _deduped_group_rows_for_key(group_key)
-    if not rows:
-        return None
-
-    index_map = {_normalize_uid(r.get("uid")): i for i, r in enumerate(rows)}
-    pos = index_map.get(normalized)
-    if pos is None:
-        return None
-
-    full_formatted = [_format_chain_item(r) for r in rows]
-    return {
-        "previous": full_formatted[pos - 1] if pos > 0 else None,
-        "current": full_formatted[pos],
-        "next": full_formatted[pos + 1] if pos < len(full_formatted) - 1 else None,
-        "full_chain": full_formatted,
-    }
+    return _minimal_chain_from_chroma(normalized)
 
 
 def format_response(scored_items, n_results, query_profile):
