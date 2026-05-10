@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "description": "Query-Aliase für /search: related_tokens erweitern Keyword-Treffer konservativ; alias_to_canonical steuert eine optionale Retrieval-Variante und leichtes Ranking-Boosting.",
+  "alias_to_canonical": {
+    "mathe": "mathematik"
+  },
+  "related_tokens": {
+    "bruchrechnen": ["bruch", "brüche", "brueche", "nenner", "zähler", "zaehler", "bruchzahl"],
+    "mathe": ["mathematik"],
+    "unterrichtsidee": ["unterricht", "lernaufgabe", "sequenz", "projekt", "lernsequenz", "doppelstunde"],
+    "gruppenarbeit": ["teamarbeit", "kooperativ", "partnerarbeit"],
+    "bewerten": ["beurteilen", "einschaetzen", "einschätzen", "reflektieren"],
+    "analysieren": ["untersuchen", "auswerten", "strukturieren"],
+    "argumentieren": ["begruenden", "begründen", "diskutieren", "eroertern", "erörtern"]
+  }
+}

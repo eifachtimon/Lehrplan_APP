@@ -1,14 +1,23 @@
 # app.py
 #------------------------------------------------------------Imports------------------------------------------------------------
 from flask import Flask, jsonify, request, send_from_directory
-from chroma_lehrplan import load_model_and_tokenizer
-import chromadb
+from chroma_lehrplan import get_chroma_client, load_model_and_tokenizer
 from pathlib import Path
 from flask_cors import CORS
 import re
 import os
 import json
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from query_aliases import (
+    active_canonical_targets,
+    build_canonical_query_variant,
+    canonical_match_bonus,
+    expand_query_tokens,
+    get_query_aliases_store,
+)
 
 #------------------------------------------------------------ChromaDB------------------------------------------------------------
 # ChromaDB
@@ -16,8 +25,12 @@ import json
 #TODO: Create Embeddings Collection when App ist build!
 #collection = init_collection()
 
-client = chromadb.PersistentClient()
+client = get_chroma_client()
 client.heartbeat()
+
+# Cached collection für schnellere Requests
+_CACHED_COLLECTION = None
+_CHROMA_EXECUTOR = ThreadPoolExecutor(max_workers=6)
 
 FACH_ALIASES = {
     "Mathematik": ["mathematik", "mathe", "bruch", "brueche", "brüche", "bruchrechnen", "geometrie", "loesungsweg", "loesungswege", "strategie", "strategien", "modellieren", "begruenden", "begruendet"],
@@ -29,16 +42,6 @@ FACH_ALIASES = {
     "Wirtschaft, Arbeit, Haushalt (mit Hauswirtschaft)": ["wah", "wirtschaft", "haushalt", "konsum", "nachhaltig", "nachhaltigem", "nachhaltigkeit", "umwelt"],
     "Natur und Technik (mit Physik, Chemie, Biologie)": ["nt", "natur und technik", "physik", "chemie", "biologie"],
     "Musik": ["musik", "rhythmus", "klang", "instrument", "koerperausdruck", "tanz", "tanzunterricht"],
-}
-
-QUERY_SYNONYMS = {
-    "bruchrechnen": ["bruch", "brüche", "brueche", "nenner", "zähler", "zaehler", "bruchzahl"],
-    "mathe": ["mathematik"],
-    "unterrichtsidee": ["unterricht", "lernaufgabe", "sequenz", "projekt", "lernsequenz", "doppelstunde"],
-    "gruppenarbeit": ["teamarbeit", "kooperativ", "partnerarbeit"],
-    "bewerten": ["beurteilen", "einschaetzen", "einschätzen", "reflektieren"],
-    "analysieren": ["untersuchen", "auswerten", "strukturieren"],
-    "argumentieren": ["begruenden", "begründen", "diskutieren", "eroertern", "erörtern"],
 }
 
 STOPWORDS = {
@@ -63,14 +66,17 @@ SEMANTIC_CONCEPTS = {
 }
 
 def init_collection():
+    global _CACHED_COLLECTION
+    if _CACHED_COLLECTION is not None:
+        return _CACHED_COLLECTION
     try:
         collection = client.get_collection(name="Lehrplan_Basel_Stadt3")
-        collection_size = collection.count()
-        print(collection_size)
+        _CACHED_COLLECTION = collection
         return collection
-    except Exception as e:  # Revised exception handling
+    except Exception as e:
         print("Error:", e)
         collection = load_model_and_tokenizer()
+        _CACHED_COLLECTION = collection
         return collection
 
 
@@ -83,19 +89,15 @@ def normalize_text(value):
 
 
 def tokenize_query(query_text):
+    """
+    Tokenliste für Keyword-Matching / Score-Normalisierung.
+    Nutzt versionierte Aliase (query_aliases.json + Legacy-Merge in query_aliases.py);
+    verwandte Tokens nur konservativ (Caps), ohne den Roh-Query-Text zu verändern.
+    """
+    store = get_query_aliases_store()
     normalized = normalize_text(query_text)
     raw_tokens = re.findall(r"\w+", normalized)
-    expanded_tokens = set(raw_tokens)
-    for token in raw_tokens:
-        if token in QUERY_SYNONYMS:
-            expanded_tokens.update(normalize_text(item) for item in QUERY_SYNONYMS[token])
-    return sorted(
-        [
-            token
-            for token in expanded_tokens
-            if len(token) >= 4 and token not in STOPWORDS
-        ]
-    )
+    return expand_query_tokens(raw_tokens, store["related_tokens"], STOPWORDS)
 
 
 def detect_fach_signals(query_text):
@@ -131,7 +133,9 @@ def split_query_into_intents(query_text):
     return cleaned[:8]
 
 
-def build_query_variants(query_text, query_schlagwort):
+def build_query_variants(query_text, query_schlagwort, alias_to_canonical=None):
+    """Varianten für Retrieval; optional eine Kanonisierungs-Zeile wenn Platz unter dem Cap von 4."""
+    alias_to_canonical = alias_to_canonical or {}
     base_query = f"{query_text} {query_schlagwort}".strip() if query_schlagwort else query_text
     intent_queries = split_query_into_intents(base_query)
     variants = [base_query] + intent_queries
@@ -142,7 +146,16 @@ def build_query_variants(query_text, query_schlagwort):
         if key and key not in seen:
             deduplicated.append(variant)
             seen.add(key)
-    return deduplicated[:10]
+
+    if len(deduplicated) < 4 and alias_to_canonical:
+        canon = build_canonical_query_variant(base_query, alias_to_canonical)
+        if canon:
+            ck = normalize_text(canon)
+            if ck and ck not in seen:
+                deduplicated.append(canon)
+                seen.add(ck)
+
+    return deduplicated[:4]
 
 
 def build_semantic_variants(query_text, fach_signals, intent_signals):
@@ -171,7 +184,7 @@ def build_semantic_variants(query_text, fach_signals, intent_signals):
         if key and key not in seen:
             deduplicated.append(prompt)
             seen.add(key)
-    return deduplicated[:8]
+    return deduplicated[:3]
 
 
 def detect_intent_signals(query_text):
@@ -275,11 +288,29 @@ def build_where_clause(filters):
 COMPETENCY_CODE_FRAGMENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)+")
 
 _competency_code_index_cache = None
+_COMPETENCY_CODE_INDEX_VERSION = 2
+
+LP21_ROW_PREFIX = "lp21:"
+
+
+def parse_lp21_row_index(chain_id):
+    """Chroma-/Such-ID: 'lp21:88175' → Zeilenindex in Lehrplan21.json (eindeutig pro Eintrag)."""
+    if chain_id is None:
+        return None
+    text = str(chain_id).strip()
+    if not text.startswith(LP21_ROW_PREFIX):
+        return None
+    tail = text[len(LP21_ROW_PREFIX) :].strip()
+    if not tail.isdigit():
+        return None
+    return int(tail)
 
 
 def _get_competency_code_index():
     global _competency_code_index_cache
-    if _competency_code_index_cache is not None:
+    if _competency_code_index_cache is not None and _competency_code_index_cache.get(
+        "v"
+    ) == _COMPETENCY_CODE_INDEX_VERSION:
         return _competency_code_index_cache
 
     code_to_uids = {}
@@ -290,21 +321,25 @@ def _get_competency_code_index():
             with open(path, "r", encoding="utf-8") as handle:
                 rows = json.load(handle)
             if isinstance(rows, list):
-                for row in rows:
-                    uid = row.get("uid")
+                for i, row in enumerate(rows):
                     code = row.get("code")
-                    if not uid or not code:
+                    if not code:
                         continue
                     key = str(code).strip()
                     if not key:
                         continue
                     all_codes.append(key)
                     lower = key.lower()
-                    code_to_uids.setdefault(lower, []).append(str(uid))
+                    stable_id = f"{LP21_ROW_PREFIX}{i}"
+                    code_to_uids.setdefault(lower, []).append(stable_id)
         except (OSError, json.JSONDecodeError):
             pass
 
-    _competency_code_index_cache = {"code_to_uids": code_to_uids, "all_codes": all_codes}
+    _competency_code_index_cache = {
+        "code_to_uids": code_to_uids,
+        "all_codes": all_codes,
+        "v": _COMPETENCY_CODE_INDEX_VERSION,
+    }
     return _competency_code_index_cache
 
 
@@ -360,16 +395,16 @@ def resolve_exact_competency_codes_in_query(query_text, query_schlagwort):
     code_to_uids = index["code_to_uids"]
     uids = []
     codes_lower = []
-    seen_uid = set()
+    seen_stable = set()
     for cand in candidates:
         ck = cand.strip().lower()
         if ck not in code_to_uids:
             continue
         codes_lower.append(ck)
-        for uid in code_to_uids[ck]:
-            if uid not in seen_uid:
-                seen_uid.add(uid)
-                uids.append(uid)
+        for stable_id in code_to_uids[ck]:
+            if stable_id not in seen_stable:
+                seen_stable.add(stable_id)
+                uids.append(stable_id)
     return {"uids": uids, "codes_lower": codes_lower}
 
 
@@ -384,10 +419,10 @@ def resolve_uids_from_competency_code_candidates(candidates):
     seen = set()
 
     def append_uids_for_code(lower_key):
-        for uid in code_to_uids.get(lower_key, []):
-            if uid not in seen:
-                seen.add(uid)
-                ordered_uids.append(uid)
+        for stable_id in code_to_uids.get(lower_key, []):
+            if stable_id not in seen:
+                seen.add(stable_id)
+                ordered_uids.append(stable_id)
 
     prefix_codes_seen = set()
 
@@ -490,7 +525,7 @@ def vector_retrieve(collection, query_text, where_clause, limit):
 
 
 def keyword_retrieve_and_upsert(collection, query_text, query_tokens, where_clause, per_token_limit, candidate_map, variant):
-    unique_tokens = query_tokens[:8]
+    unique_tokens = query_tokens[:4]
     full_query_kwargs = {
         "query_texts": [query_text],
         "where_document": {"$contains": query_text},
@@ -533,10 +568,207 @@ def keyword_retrieve_and_upsert(collection, query_text, query_tokens, where_clau
         )
 
 
-def score_candidates(candidate_map, query_tokens, fach_signals, intent_signals, weights):
+def parallel_retrieve_all(collection, query_variants, semantic_variants, where_clause, n_results, weights):
+    """
+    Führt alle Vector- und Keyword-Queries parallel aus.
+    Gibt candidate_map zurück.
+    """
+    vector_limit = max(40, n_results * 4)
+    keyword_limit = max(10, n_results * 2)
+    candidate_map = {}
+
+    def do_vector_query(variant, source, source_weight):
+        limit = vector_limit if source == "vector" else max(25, n_results * 3)
+        return ("vector", variant, source, source_weight, vector_retrieve(collection, variant, where_clause, limit=limit))
+
+    def do_keyword_query(variant, token, is_full_query):
+        query_kwargs = {"query_texts": [variant], "n_results": keyword_limit}
+        if is_full_query:
+            query_kwargs["where_document"] = {"$contains": variant}
+        else:
+            query_kwargs["where_document"] = {"$contains": token}
+        if where_clause:
+            query_kwargs["where"] = where_clause
+        return ("keyword", variant, token, is_full_query, collection.query(**query_kwargs))
+
+    futures = []
+    
+    for variant in query_variants:
+        futures.append(_CHROMA_EXECUTOR.submit(do_vector_query, variant, "vector", 1.0))
+        futures.append(_CHROMA_EXECUTOR.submit(do_keyword_query, variant, "__full_query__", True))
+        vtokens = tokenize_query(variant)[:4]
+        for token in vtokens:
+            futures.append(_CHROMA_EXECUTOR.submit(do_keyword_query, variant, token, False))
+
+    for semantic_variant in semantic_variants:
+        futures.append(_CHROMA_EXECUTOR.submit(do_vector_query, semantic_variant, "semantic_vector", weights["semantic_weight"]))
+
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+            if result[0] == "vector":
+                _, variant, source, source_weight, data = result
+                upsert_candidate(
+                    candidate_map,
+                    data.get("ids", [[]])[0],
+                    data.get("documents", [[]])[0],
+                    data.get("metadatas", [[]])[0],
+                    data.get("distances", [[]])[0],
+                    source,
+                    variant=variant,
+                    source_weight=source_weight,
+                )
+            else:
+                _, variant, token, is_full_query, data = result
+                upsert_candidate(
+                    candidate_map,
+                    data.get("ids", [[]])[0],
+                    data.get("documents", [[]])[0],
+                    data.get("metadatas", [[]])[0],
+                    data.get("distances", [[]])[0],
+                    "keyword",
+                    token=token,
+                    variant=variant,
+                    source_weight=1.15 if is_full_query else 1.0,
+                )
+        except Exception as e:
+            print(f"[parallel_retrieve] Error: {e}")
+
+    return candidate_map
+
+
+# --- Ranking: Themenbereich, Phrase, 2. Stufe, MMR ---------------------------------
+
+SECOND_STAGE_POOL_CAP = 100
+SECOND_STAGE_LEX_WEIGHT = 0.12
+MMR_LAMBDA = 0.68
+MMR_POOL_MIN = 36
+
+
+def themenbereich_query_overlap(query_text, themenbereich):
+    """Anteil der Themenbereich-Tokens, die in der Query vorkommen (0–1)."""
+    if not themenbereich:
+        return 0.0
+    qt = {
+        t
+        for t in re.findall(r"\w+", normalize_text(query_text))
+        if len(t) >= 3 and t not in STOPWORDS
+    }
+    tb = {t for t in re.findall(r"\w+", normalize_text(themenbereich)) if len(t) >= 2}
+    if not tb:
+        return 0.0
+    inter = len(qt & tb)
+    return inter / len(tb)
+
+
+def phrase_presence_bonus(combined_query, document_text):
+    """Boost wenn die normalisierte Query (oder ein längerer Präfix) im Kompetenztext vorkommt."""
+    nq = normalize_text(combined_query).strip()
+    nd = normalize_text(document_text)
+    if len(nq) < 10:
+        return 0.0
+    if nq in nd:
+        return 1.0
+    chunk = nq[:72].rstrip()
+    if len(chunk) >= 10 and chunk in nd:
+        return 0.88
+    return 0.0
+
+
+def lexical_overlap_ratio(query_text, document_text):
+    """Anteil der Query-Stichwörter (>=3), die im Dokument vorkommen — zweite Ranking-Stufe."""
+    q_tokens = {
+        t
+        for t in re.findall(r"\w+", normalize_text(query_text))
+        if len(t) >= 3 and t not in STOPWORDS
+    }
+    if not q_tokens:
+        return 0.0
+    d_tokens = set(re.findall(r"\w+", normalize_text(document_text)))
+    return len(q_tokens & d_tokens) / len(q_tokens)
+
+
+def document_token_set_for_mmr(document_text):
+    return {t for t in re.findall(r"\w+", normalize_text(document_text)) if len(t) >= 3}
+
+
+def jaccard_tokens(set_a, set_b):
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return inter / union if union else 0.0
+
+
+def apply_second_stage_rerank(scored_items, combined_query, pool_cap=SECOND_STAGE_POOL_CAP):
+    """Erhöht die Gewichtung lexikalischer Übereinstimmung für die obersten Treffer und sortiert neu."""
+    if not scored_items or not combined_query.strip():
+        return scored_items
+    pool_cap = min(pool_cap, len(scored_items))
+    for i in range(pool_cap):
+        item = scored_items[i]
+        lex = lexical_overlap_ratio(combined_query, item["document"])
+        item["final_score"] = item["final_score"] + SECOND_STAGE_LEX_WEIGHT * lex
+    scored_items.sort(key=lambda entry: entry["final_score"], reverse=True)
+    return scored_items
+
+
+def mmr_diversify(ranked_items, n_results, lambda_param=MMR_LAMBDA):
+    """Maximal Marginal Relevance: Relevanz vs. Redundanz (Jaccard auf Dokument-Tokens)."""
+    if n_results <= 0:
+        return []
+    if not ranked_items:
+        return []
+
+    pool_size = min(
+        len(ranked_items),
+        max(MMR_POOL_MIN, n_results * 5),
+    )
+    pool = ranked_items[:pool_size]
+    doc_tokens = [document_token_set_for_mmr(item["document"]) for item in pool]
+
+    scores = [item["final_score"] for item in pool]
+    max_s, min_s = max(scores), min(scores)
+    span = (max_s - min_s) if max_s > min_s else 1.0
+
+    def relevance_at(idx):
+        return (pool[idx]["final_score"] - min_s) / span
+
+    selected_idx = []
+    remaining = set(range(len(pool)))
+
+    while len(selected_idx) < n_results and remaining:
+        best_i = None
+        best_mmr = -1e9
+        for i in remaining:
+            rel = relevance_at(i)
+            if selected_idx:
+                max_sim = max(jaccard_tokens(doc_tokens[i], doc_tokens[j]) for j in selected_idx)
+            else:
+                max_sim = 0.0
+            mmr_score = lambda_param * rel - (1.0 - lambda_param) * max_sim
+            if mmr_score > best_mmr:
+                best_mmr = mmr_score
+                best_i = i
+        selected_idx.append(best_i)
+        remaining.discard(best_i)
+
+    return [pool[i] for i in selected_idx]
+
+
+def score_candidates(
+    candidate_map,
+    query_tokens,
+    fach_signals,
+    intent_signals,
+    weights,
+    combined_query="",
+    canonical_boost_terms=None,
+):
     scored_items = []
     token_count = max(len(query_tokens), 1)
     intent_count = max(len(intent_signals), 1)
+    boost_targets = canonical_boost_terms or set()
 
     for item in candidate_map.values():
         distance = item["best_distance"] if item["best_distance"] is not None else 2.5
@@ -563,6 +795,14 @@ def score_candidates(candidate_map, query_tokens, fach_signals, intent_signals, 
             )
             metadata_score += min(matched_intents / intent_count, 1.0) * 0.7
 
+        if combined_query.strip():
+            tb = item["metadata"].get("themenbereich") or ""
+            tb_ov = themenbereich_query_overlap(combined_query, tb)
+            metadata_score += min(tb_ov * 1.15, 1.15)
+
+            ph = phrase_presence_bonus(combined_query, item["document"])
+            keyword_score = min(keyword_score + 0.32 * ph, 1.0)
+
         if "__full_query__" in item["keyword_hits"]:
             keyword_score = min(keyword_score + 0.25, 1.0)
 
@@ -573,45 +813,13 @@ def score_candidates(candidate_map, query_tokens, fach_signals, intent_signals, 
             + (weights["variant"] * variant_score)
             + (weights["rrf"] * rrf_score)
         )
+        if boost_targets:
+            final_score += canonical_match_bonus(item["document"], boost_targets)
         item["final_score"] = final_score
         scored_items.append(item)
 
     scored_items.sort(key=lambda entry: entry["final_score"], reverse=True)
     return scored_items
-
-
-def diversify_by_fach(scored_items, n_results):
-    if n_results <= 0:
-        return []
-
-    selected = []
-    fach_counts = {}
-
-    for item in scored_items:
-        if len(selected) >= n_results:
-            break
-
-        fach = item["metadata"].get("fach", "__unknown__")
-        current_count = fach_counts.get(fach, 0)
-        # Keep the first pass balanced: max 2 items per fach.
-        if current_count >= 2:
-            continue
-
-        selected.append(item)
-        fach_counts[fach] = current_count + 1
-
-    if len(selected) >= n_results:
-        return selected[:n_results]
-
-    selected_ids = {item["id"] for item in selected}
-    for item in scored_items:
-        if len(selected) >= n_results:
-            break
-        if item["id"] in selected_ids:
-            continue
-        selected.append(item)
-
-    return selected[:n_results]
 
 
 # --- Kompetenz-Aufbaukette (muss vor format_response stehen) -----------------
@@ -621,6 +829,8 @@ LEHRPLAN_JSON_PATH = Path(
 )
 CHAIN_KEY_FIELDS = ("fb_id", "f_id", "kb_id", "ha_id", "k_id", "aufbau")
 
+_CHAIN_GROUP_ROWS_CACHE_EPOCH = 2
+_chain_group_rows_cache_epoch = 0
 _chain_group_rows_cache = {}
 _lehrplan_json_rows = None
 
@@ -635,7 +845,7 @@ def _normalize_uid(uid):
 def _format_chain_item(item):
     if not item:
         return None
-    return {
+    out = {
         "uid": item.get("uid"),
         "code": item.get("code"),
         "text": item.get("text"),
@@ -645,6 +855,10 @@ def _format_chain_item(item):
         "url": item.get("url"),
         "folge_in_aufbaute": item.get("folge_in_aufbaute"),
     }
+    dk = item.get("doc_key")
+    if dk:
+        out["doc_key"] = str(dk).strip()
+    return out
 
 
 def _load_lehrplan_rows():
@@ -665,27 +879,37 @@ def _load_lehrplan_rows():
 
 
 def _dedupe_chain_rows(rows):
-    """Lehrplan-Daten haben dieselbe uid mehrfach (Varianten); für die Kette nur erste Zeile pro uid."""
+    """
+    Sortierung für die Aufbau-Reihenfolge. Echte Duplikate nur bei gleicher uid und gleichem Text
+    (identische Zeile); unterschiedliche Formulierungen mit gleicher offizieller uid bleiben erhalten.
+    """
+    rows = list(rows)
     rows.sort(
         key=lambda row: (
             int(str(row.get("folge_in_aufbaute") or "0")),
             str(row.get("uid") or ""),
+            str(row.get("text") or "")[:96],
         )
     )
     deduped = []
-    seen_uid = set()
+    seen_sig = set()
     for row in rows:
         uid_key = _normalize_uid(row.get("uid"))
-        if not uid_key or uid_key in seen_uid:
+        text_key = (row.get("text") or "").strip()
+        sig = (uid_key, text_key)
+        if sig in seen_sig:
             continue
-        seen_uid.add(uid_key)
+        seen_sig.add(sig)
         deduped.append(row)
     return deduped
 
 
 def _deduped_group_rows_for_key(group_key):
-    """Sortierte, nach uid deduplizierte Zeilen einer Aufbau-Gruppe (mit Cache pro Gruppe)."""
-    global _chain_group_rows_cache
+    """Sortierte Zeilen einer Aufbau-Gruppe (Cache pro Gruppe; Epoch bei Dedupe-Änderung)."""
+    global _chain_group_rows_cache, _chain_group_rows_cache_epoch
+    if _chain_group_rows_cache_epoch != _CHAIN_GROUP_ROWS_CACHE_EPOCH:
+        _chain_group_rows_cache.clear()
+        _chain_group_rows_cache_epoch = _CHAIN_GROUP_ROWS_CACHE_EPOCH
     if group_key in _chain_group_rows_cache:
         return _chain_group_rows_cache[group_key]
 
@@ -705,8 +929,97 @@ def _deduped_group_rows_for_key(group_key):
     return deduped
 
 
-def _minimal_chain_from_chroma(normalized_uid):
+_KOMPETENZTITEL_PATTERN = re.compile(
+    r'class="kompetenztitel[^>]*>[\s\S]*?komptitelnr[^<]*</p>\s*<p>\s*([^<]+)',
+    re.IGNORECASE,
+)
+
+_CHAIN_HEADINGS_STORE = None
+_HTTP_CHAIN_HEADING_CACHE = {}
+
+CHAIN_HEADINGS_JSON = Path(
+    os.getenv("CHAIN_HEADINGS_JSON", str(Path(__file__).resolve().parent / "chain_headings.json"))
+)
+
+
+def _load_chain_headings_store():
+    """Liest chain_headings.json (von build_chain_headings.py erzeugt) — kein Netzwerk zur Laufzeit."""
+    global _CHAIN_HEADINGS_STORE
+    if _CHAIN_HEADINGS_STORE is not None:
+        return _CHAIN_HEADINGS_STORE
+    _CHAIN_HEADINGS_STORE = {}
+    path = CHAIN_HEADINGS_JSON
+    if not path.is_file():
+        return _CHAIN_HEADINGS_STORE
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return _CHAIN_HEADINGS_STORE
+    if not isinstance(raw, dict):
+        return _CHAIN_HEADINGS_STORE
+    for key, val in raw.items():
+        if not key or not isinstance(val, str):
+            continue
+        uid_base = str(key).strip().split(".")[0]
+        text = val.strip()
+        if uid_base and text:
+            _CHAIN_HEADINGS_STORE[uid_base] = text
+    return _CHAIN_HEADINGS_STORE
+
+
+def _fetch_bs_chain_heading_http(uid_base):
+    """Nur für Entwicklung / fehlende Einträge; Production nutzt chain_headings.json."""
+    req = urllib.request.Request(
+        f"https://BS.lehrplan.ch/{uid_base}",
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; LehrplanBaselSearch/1.0)",
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            html = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    match = _KOMPETENZTITEL_PATTERN.search(html)
+    return match.group(1).strip() if match else None
+
+
+def fetch_bs_chain_heading(uid):
+    """
+    Übergeordnete Kompetenzformulierung (kompetenztitel auf BS-Lehrplan).
+    Standard: nur aus chain_headings.json (offline, schnell bei /search).
+    Optional: CHAIN_HEADING_HTTP_FALLBACK=1 lädt einzelne fehlende Titel nach (langsam).
+    DISABLE_BS_CHAIN_HEADING=1 schaltet alles ab.
+    """
+    if os.getenv("DISABLE_BS_CHAIN_HEADING", "").strip().lower() in ("1", "true", "yes"):
+        return None
+    if not uid:
+        return None
+    base = str(uid).strip().split(".")[0]
+    if not base:
+        return None
+
+    store = _load_chain_headings_store()
+    if base in store:
+        return store[base]
+
+    if os.getenv("CHAIN_HEADING_HTTP_FALLBACK", "").strip().lower() in ("1", "true", "yes"):
+        if base in _HTTP_CHAIN_HEADING_CACHE:
+            return _HTTP_CHAIN_HEADING_CACHE[base]
+        title = _fetch_bs_chain_heading_http(base)
+        if title:
+            _HTTP_CHAIN_HEADING_CACHE[base] = title
+        return title
+
+    return None
+
+
+def _minimal_chain_from_chroma(chain_key):
     """Wenn Lehrplan21.json fehlt oder UID dort nicht vorkommt: nur aktuelle Stufe aus Chroma."""
+    normalized_uid = _normalize_uid(chain_key)
+    if not normalized_uid:
+        return None
     try:
         collection = init_collection()
         result = collection.get(ids=[normalized_uid], include=["metadatas", "documents"])
@@ -717,15 +1030,25 @@ def _minimal_chain_from_chroma(normalized_uid):
         docs = result.get("documents") or []
         text_body = docs[0] if docs else ""
         synthetic = {**meta, "text": text_body}
+        dk = meta.get("doc_key") or (
+            f"{LP21_ROW_PREFIX}{meta['lp21_row_index']}"
+            if meta.get("lp21_row_index") not in (None, "")
+            else None
+        )
+        if dk:
+            synthetic["doc_key"] = str(dk).strip()
         item = _format_chain_item(synthetic)
         if not item or not item.get("uid"):
             return None
+        heading_uid = _normalize_uid(item.get("uid"))
+        heading = fetch_bs_chain_heading(heading_uid)
         return {
             "previous": None,
             "current": item,
             "next": None,
             "full_chain": [item],
             "_chain_partial": True,
+            "chain_heading": heading,
         }
     except Exception as exc:
         print(f"Aufbau-Kette Chroma-Fallback fehlgeschlagen ({normalized_uid}): {exc}")
@@ -734,45 +1057,332 @@ def _minimal_chain_from_chroma(normalized_uid):
 
 def lookup_competency_chain(uid):
     """Vorgänger, aktuelle Stufe, Nachfolger und volle Kette (für Navigation ohne zweiten Request)."""
-    normalized = _normalize_uid(uid)
-    if not normalized:
+    raw = _normalize_uid(uid)
+    if not raw:
         return None
 
     json_data = _load_lehrplan_rows()
+    row_index = parse_lp21_row_index(raw)
+    target_row = None
+
     if json_data:
-        target_row = None
-        for row in json_data:
-            if row.get("strukturtyp") != "Kompetenzstufe":
+        if row_index is not None:
+            if 0 <= row_index < len(json_data):
+                target_row = json_data[row_index]
+        else:
+            for row in json_data:
+                if row.get("strukturtyp") != "Kompetenzstufe":
+                    continue
+                if _normalize_uid(row.get("uid")) == raw:
+                    target_row = row
+                    break
+
+    if target_row and target_row.get("strukturtyp") == "Kompetenzstufe":
+        group_key = tuple(str(target_row.get(k, "") or "") for k in CHAIN_KEY_FIELDS)
+        rows = _deduped_group_rows_for_key(group_key)
+        if rows:
+            pos = next((i for i, r in enumerate(rows) if r is target_row), None)
+            if pos is not None:
+                full_formatted = []
+                for r in rows:
+                    try:
+                        ri = json_data.index(r)
+                    except ValueError:
+                        ri = None
+                    row_payload = dict(r)
+                    if ri is not None:
+                        row_payload["doc_key"] = f"{LP21_ROW_PREFIX}{ri}"
+                    item = _format_chain_item(row_payload)
+                    links = _network_links_for_row(r)
+                    if links:
+                        item["network_links"] = links
+                    full_formatted.append(item)
+                current_row = rows[pos]
+                current_links = _network_links_for_row(current_row)
+                heading = fetch_bs_chain_heading(_normalize_uid(target_row.get("uid")))
+                return {
+                    "previous": full_formatted[pos - 1] if pos > 0 else None,
+                    "current": full_formatted[pos],
+                    "next": full_formatted[pos + 1] if pos < len(full_formatted) - 1 else None,
+                    "full_chain": full_formatted,
+                    "_has_network": bool(current_links),
+                    "chain_heading": heading,
+                }
+
+    return _minimal_chain_from_chroma(raw)
+
+
+# LP21-Fachkürzel (Lehrplan 21 „Abkürzungen und Codes“) → JSON-Schreibweise „fach“.
+LP21_FACH_NAME_TO_TOKEN = {
+    "Deutsch": "D",
+    "Englisch": "FS1E",
+    "Französisch": "FS2F",
+    "Italienisch": "FS3I",
+    "Latein": "LAT",
+    "Mathematik": "MA",
+    "Natur, Mensch, Gesellschaft (1./2. Zyklus)": "NMG",
+    "Natur und Technik (mit Physik, Chemie, Biologie)": "NT",
+    "Wirtschaft, Arbeit, Haushalt (mit Hauswirtschaft)": "WAH",
+    "Räume, Zeiten, Gesellschaften (mit Geografie, Geschichte)": "RZG",
+    "Ethik, Religionen, Gemeinschaft (mit Lebenskunde)": "ERG",
+    "Bildnerisches Gestalten": "BG",
+    "Textiles und Technisches Gestalten": "TTG",
+    "Musik": "MU",
+    "Bewegung und Sport": "BS",
+    "Medien und Informatik": "MI",
+    "Berufliche Orientierung": "BO",
+}
+
+
+def _competenz_cluster_code(code):
+    """
+    Code ohne Kompetenzstufe: letztes Segment ist z. B. ein Buchstabe (… .c)
+    oder zusammengezogen (… .1a). Wird für Themen-„Code-Hinweise“ je Kette genutzt.
+    """
+    if not code or not isinstance(code, str):
+        return None
+    parts = [p.strip() for p in code.strip().split(".") if p.strip()]
+    if len(parts) <= 1:
+        return parts[0] if parts else None
+    last = parts[-1]
+    if len(last) == 1 and last.isalpha():
+        return ".".join(parts[:-1])
+    merged = re.fullmatch(r"(\d+)([a-zA-Z])", last)
+    if merged:
+        return ".".join(parts[:-1] + [merged.group(1)])
+    return ".".join(parts[:-1])
+
+
+def _ordered_chain_stage_codes(rows):
+    """Alle Kompetenzstufen-Codes einer Kette, sortiert nach Aufbau-Reihenfolge."""
+    ordered = sorted(
+        rows,
+        key=lambda r: (int(str(r.get("folge_in_aufbaute") or "0")), str(r.get("uid") or "")),
+    )
+    out = []
+    seen = set()
+    for r in ordered:
+        c = r.get("code")
+        if not c:
+            continue
+        text = str(c).strip()
+        if text and text not in seen:
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def _lp_themenbereich_prefix(code):
+    """
+    Themen-/Strukturebene im LP21-Code: erste drei Segmente
+    (Fach · Kompetenzbereich · Handlungs-/Themenaspekt), soweit vorhanden.
+    """
+    if not code:
+        return None
+    parts = [p.strip() for p in str(code).strip().split(".") if p.strip()]
+    if len(parts) >= 3:
+        return ".".join(parts[:3])
+    return parts[0] if parts else None
+
+
+def _split_themenbereich_head(tb):
+    """Erstes Wort (z. B. Kompetenzbereich-Titel) und Rest (Aspekt-/Untertitel)."""
+    text = (tb or "").strip()
+    if not text:
+        return "", ""
+    idx = text.find(" ")
+    if idx == -1:
+        return text, ""
+    return text[:idx].strip(), text[idx + 1 :].strip()
+
+
+_NO_ASPECT_KEY = "__no_aspect__"
+
+
+# Reihenfolge wie Frontend fachOptions (Landkarte / Übersicht).
+_CURRICULUM_FACH_ORDER = (
+    "Italienisch",
+    "Französisch",
+    "Englisch",
+    "Latein",
+    "Deutsch",
+    "Bewegung und Sport",
+    "Natur, Mensch, Gesellschaft (1./2. Zyklus)",
+    "Ethik, Religionen, Gemeinschaft (mit Lebenskunde)",
+    "Räume, Zeiten, Gesellschaften (mit Geografie, Geschichte)",
+    "Natur und Technik (mit Physik, Chemie, Biologie)",
+    "Wirtschaft, Arbeit, Haushalt (mit Hauswirtschaft)",
+    "Medien und Informatik",
+    "Musik",
+    "Bildnerisches Gestalten",
+    "Textiles und Technisches Gestalten",
+    "Mathematik",
+    "Berufliche Orientierung",
+)
+
+_curriculum_overview_cache = None
+
+
+def build_curriculum_overview():
+    """
+    Landkarte als Outline: Fach → Kompetenzbereich (2 Segmente) → Aspekt (3 Segmente)
+    → Kompetenz (chain_heading + cluster_code) → Stufen (text + code).
+    """
+    global _curriculum_overview_cache
+    if _curriculum_overview_cache is not None:
+        return _curriculum_overview_cache
+
+    from collections import defaultdict
+
+    json_data = _load_lehrplan_rows()
+    if not json_data:
+        _curriculum_overview_cache = {"subjects": []}
+        return _curriculum_overview_cache
+
+    groups = defaultdict(list)
+    for row in json_data:
+        if row.get("strukturtyp") != "Kompetenzstufe":
+            continue
+        key = tuple(str(row.get(k, "") or "") for k in CHAIN_KEY_FIELDS)
+        groups[key].append(row)
+
+    # fach -> kb_key -> aspect_key -> [chain_payload, ...]
+    bucket = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+    for _key, rows in groups.items():
+        deduped = _dedupe_chain_rows(list(rows))
+        if not deduped:
+            continue
+        first = deduped[0]
+        fach_name = (first.get("fach") or "Unbekannt").strip()
+        uid = _normalize_uid(first.get("uid"))
+        if not uid:
+            continue
+        codes_ordered = _ordered_chain_stage_codes(deduped)
+        primary_text = str(codes_ordered[0]).strip() if codes_ordered else first.get("code")
+        primary_text = str(primary_text or "").strip()
+        if not primary_text:
+            continue
+        parts = [p.strip() for p in primary_text.split(".") if p.strip()]
+        if len(parts) < 2:
+            continue
+        kb_key = ".".join(parts[:2])
+        aspect_key = ".".join(parts[:3]) if len(parts) >= 3 else _NO_ASPECT_KEY
+
+        tb = (first.get("themenbereich") or "").strip()
+        fw, rest = _split_themenbereich_head(tb)
+        heading = fetch_bs_chain_heading(uid)
+        if not heading:
+            heading = str(first.get("code") or "").strip() or uid
+        cluster = _competenz_cluster_code(primary_text)
+        stages = []
+        for r in sorted(
+            deduped,
+            key=lambda r: (int(str(r.get("folge_in_aufbaute") or "0")), str(r.get("uid") or "")),
+        ):
+            sc = r.get("code")
+            if not sc:
                 continue
-            if _normalize_uid(row.get("uid")) == normalized:
-                target_row = row
-                break
+            st_uid = _normalize_uid(r.get("uid"))
+            stages.append(
+                {
+                    "uid": st_uid,
+                    "code": str(sc).strip(),
+                    "text": (r.get("text") or "").strip(),
+                }
+            )
 
-        if target_row:
-            group_key = tuple(str(target_row.get(k, "") or "") for k in CHAIN_KEY_FIELDS)
-            rows = _deduped_group_rows_for_key(group_key)
-            if rows:
-                index_map = {_normalize_uid(r.get("uid")): i for i, r in enumerate(rows)}
-                pos = index_map.get(normalized)
-                if pos is not None:
-                    full_formatted = []
-                    for r in rows:
-                        item = _format_chain_item(r)
-                        links = _network_links_for_row(r)
-                        if links:
-                            item["network_links"] = links
-                        full_formatted.append(item)
-                    current_row = rows[pos]
-                    current_links = _network_links_for_row(current_row)
-                    return {
-                        "previous": full_formatted[pos - 1] if pos > 0 else None,
-                        "current": full_formatted[pos],
-                        "next": full_formatted[pos + 1] if pos < len(full_formatted) - 1 else None,
-                        "full_chain": full_formatted,
-                        "_has_network": bool(current_links),
+        chain_obj = {
+            "anchor_uid": uid,
+            "cluster_code": cluster,
+            "heading": heading,
+            "first_word": fw,
+            "rest_tb": rest,
+            "stages": stages,
+        }
+        bucket[fach_name][kb_key][aspect_key].append(chain_obj)
+
+    def _fach_sort_key(name):
+        try:
+            idx = _CURRICULUM_FACH_ORDER.index(name)
+            return (0, idx)
+        except ValueError:
+            return (1, name)
+
+    def _aspect_sort_key(k):
+        if k == _NO_ASPECT_KEY:
+            return "\uffff"
+        return k.lower()
+
+    subjects = []
+    for fach_name in sorted(bucket.keys(), key=lambda n: (_fach_sort_key(n)[0], _fach_sort_key(n)[1])):
+        kb_map = bucket[fach_name]
+        kb_nodes = []
+        for kb_key in sorted(kb_map.keys(), key=lambda x: (x.lower(), x)):
+            aspect_map = kb_map[kb_key]
+            kb_label = ""
+            for ak in sorted(aspect_map.keys(), key=_aspect_sort_key):
+                for ch in aspect_map[ak]:
+                    fw = ch.get("first_word") or ""
+                    if fw:
+                        kb_label = fw
+                        break
+                if kb_label:
+                    break
+            if not kb_label:
+                kb_label = kb_key
+
+            aspect_nodes = []
+            for aspect_key in sorted(aspect_map.keys(), key=_aspect_sort_key):
+                chain_list = aspect_map[aspect_key]
+                chain_list.sort(
+                    key=lambda c: (str(c.get("cluster_code") or "").lower(), str(c.get("anchor_uid") or ""))
+                )
+                chains_out = [
+                    {
+                        "anchor_uid": c["anchor_uid"],
+                        "cluster_code": c.get("cluster_code"),
+                        "heading": c.get("heading") or "",
+                        "stages": c.get("stages") or [],
                     }
+                    for c in chain_list
+                ]
+                if aspect_key == _NO_ASPECT_KEY:
+                    aspect_nodes.append(
+                        {
+                            "aspect_code": None,
+                            "aspect_label": "",
+                            "chains": chains_out,
+                        }
+                    )
+                else:
+                    aspect_label = (chain_list[0].get("rest_tb") or "").strip() if chain_list else ""
+                    aspect_nodes.append(
+                        {
+                            "aspect_code": aspect_key,
+                            "aspect_label": aspect_label,
+                            "chains": chains_out,
+                        }
+                    )
 
-    return _minimal_chain_from_chroma(normalized)
+            kb_nodes.append(
+                {
+                    "kb_code": kb_key,
+                    "kb_label": kb_label,
+                    "aspects": aspect_nodes,
+                }
+            )
+
+        subjects.append(
+            {
+                "name": fach_name,
+                "fach_code": LP21_FACH_NAME_TO_TOKEN.get(fach_name),
+                "outline": kb_nodes,
+            }
+        )
+
+    _curriculum_overview_cache = {"subjects": subjects}
+    return _curriculum_overview_cache
 
 
 # --- Kompetenz-Vernetzung (Querverweise aus Lehrplan21.json) -----------------
@@ -922,12 +1532,7 @@ def infer_primary_match_channel(sources):
     return "vector"
 
 
-def format_response(scored_items, n_results, query_profile, exact_competency_code=False):
-    if exact_competency_code:
-        cap = min(len(scored_items), 50)
-        top_items = scored_items[:cap]
-    else:
-        top_items = diversify_by_fach(scored_items, n_results)
+def format_response(top_items, query_profile):
     metadata_rows = []
     for rank_idx, item in enumerate(top_items, start=1):
         competency_chain = lookup_competency_chain(str(item["id"]))
@@ -990,6 +1595,17 @@ def competency_network(uid):
     return jsonify(payload)
 
 
+@app.route('/curriculum-overview', methods=['GET'])
+@app.route('/api/curriculum-overview', methods=['GET'])
+def curriculum_overview():
+    try:
+        payload = build_curriculum_overview()
+        return jsonify(payload)
+    except Exception as exc:
+        print(f"curriculum-overview: {exc}")
+        return jsonify({"subjects": [], "error": "build_failed"}), 500
+
+
 @app.route('/search', methods=['POST'])
 def search():
     collection = init_collection()
@@ -1008,13 +1624,17 @@ def search():
         filters = {**filters, "zyklus": sorted(inferred_zyklus)}
 
     where_clause = build_where_clause(filters)
-    query_tokens = tokenize_query(f"{query_text} {query_schlagwort}".strip())
+    combined_for_tokens = f"{query_text} {query_schlagwort}".strip()
+    alias_store = get_query_aliases_store()
+    query_tokens = tokenize_query(combined_for_tokens)
+    alias_to_canonical = alias_store.get("alias_to_canonical") or {}
+    canonical_boost_terms = active_canonical_targets(combined_for_tokens, alias_to_canonical)
     fach_signals = detect_fach_signals(query_text)
     intent_signals = detect_intent_signals(query_text)
     query_profile = classify_query_profile(query_text, query_tokens, intent_signals)
     weights = get_score_weights(query_profile)
     n_results = resolve_n_results(requested_n_results, query_profile)
-    query_variants = build_query_variants(query_text, query_schlagwort)
+    query_variants = build_query_variants(query_text, query_schlagwort, alias_to_canonical)
     semantic_variants = build_semantic_variants(query_text, fach_signals, intent_signals)
 
     exact_scope = resolve_exact_competency_codes_in_query(query_text, query_schlagwort)
@@ -1024,45 +1644,22 @@ def search():
     competency_code_lookup_retrieve(collection, query_text, query_schlagwort, filters, candidate_map)
 
     if not exact_competency_code:
-        vector_limit = max(40, n_results * 4)
-        keyword_limit = max(10, n_results * 2)
+        parallel_candidates = parallel_retrieve_all(
+            collection, query_variants, semantic_variants, where_clause, n_results, weights
+        )
+        candidate_map.update(parallel_candidates)
 
-        for variant in query_variants:
-            vector_results = vector_retrieve(collection, variant, where_clause, limit=vector_limit)
-            upsert_candidate(
-                candidate_map,
-                vector_results.get("ids", [[]])[0],
-                vector_results.get("documents", [[]])[0],
-                vector_results.get("metadatas", [[]])[0],
-                vector_results.get("distances", [[]])[0],
-                "vector",
-                variant=variant,
-                source_weight=1.0,
-            )
-            keyword_retrieve_and_upsert(
-                collection,
-                variant,
-                tokenize_query(variant),
-                where_clause,
-                per_token_limit=keyword_limit,
-                candidate_map=candidate_map,
-                variant=variant,
-            )
+    combined_query = f"{query_text} {query_schlagwort}".strip()
 
-        for semantic_variant in semantic_variants:
-            semantic_vector_results = vector_retrieve(collection, semantic_variant, where_clause, limit=max(25, n_results * 3))
-            upsert_candidate(
-                candidate_map,
-                semantic_vector_results.get("ids", [[]])[0],
-                semantic_vector_results.get("documents", [[]])[0],
-                semantic_vector_results.get("metadatas", [[]])[0],
-                semantic_vector_results.get("distances", [[]])[0],
-                "semantic_vector",
-                variant=semantic_variant,
-                source_weight=weights["semantic_weight"],
-            )
-
-    scored_items = score_candidates(candidate_map, query_tokens, fach_signals, intent_signals, weights)
+    scored_items = score_candidates(
+        candidate_map,
+        query_tokens,
+        fach_signals,
+        intent_signals,
+        weights,
+        combined_query=combined_query,
+        canonical_boost_terms=canonical_boost_terms,
+    )
 
     if exact_competency_code:
         allowed_uids = set(exact_scope["uids"])
@@ -1071,12 +1668,17 @@ def search():
             for item in scored_items
             if item["id"] in allowed_uids and metadata_matches_request_filters(item["metadata"], filters)
         ]
+        top_items = scored_items[: min(len(scored_items), 50)]
+    else:
+        scored_items = apply_second_stage_rerank(scored_items, combined_query)
+        top_items = mmr_diversify(scored_items, n_results)
 
-    response = format_response(scored_items, n_results, query_profile, exact_competency_code=exact_competency_code)
+    response = format_response(top_items, query_profile)
     response["meta"] = {
         "n_results_used": n_results,
         "query_profile": query_profile,
         "exact_competency_code": exact_competency_code,
+        "query_aliases_version": alias_store.get("version", 0),
     }
     return jsonify(response)
 
