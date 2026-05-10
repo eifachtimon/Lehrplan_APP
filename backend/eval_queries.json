@@ -1,0 +1,42 @@
+[
+  {
+    "query": "Mathematik Bruchrechnen",
+    "expected_fach": "Mathematik"
+  },
+  {
+    "query": "Ich plane eine Mathe Stunde zu Bruchrechnen mit Gruppenarbeit",
+    "expected_fach": "Mathematik"
+  },
+  {
+    "query": "Idee fuer Schwimmunterricht Brustgleichschlag",
+    "expected_fach": "Bewegung und Sport"
+  },
+  {
+    "query": "Unterrichtsidee zu französischer Aussprache",
+    "expected_fach": "Französisch"
+  },
+  {
+    "query": "Lernsequenz zum Koerperausdruck zu Musik",
+    "expected_fach": "Musik"
+  },
+  {
+    "query": "Lektionsplanung Klasse 8: Quellen bewerten und argumentieren im Fach RZG",
+    "expected_fach": "Räume, Zeiten, Gesellschaften (mit Geografie, Geschichte)"
+  },
+  {
+    "query": "Projekt in Zyklus 3 zu nachhaltigem Konsum und reflektieren",
+    "expected_fach": "Wirtschaft, Arbeit, Haushalt (mit Hauswirtschaft)"
+  },
+  {
+    "query": "Sequenz in Klasse 7 zu Daten auswerten und kritisch beurteilen in Natur und Technik",
+    "expected_fach": "Natur und Technik (mit Physik, Chemie, Biologie)"
+  },
+  {
+    "query": "Lernarrangement 6. Klasse: Loesungswege begruenden und gemeinsam Strategien entwickeln",
+    "expected_fach": "Mathematik"
+  },
+  {
+    "query": "Schuelerinnen und Schueler sollen Quellen einordnen, Positionen abwaegen und begruendet urteilen",
+    "expected_fach": "Räume, Zeiten, Gesellschaften (mit Geografie, Geschichte)"
+  }
+]
