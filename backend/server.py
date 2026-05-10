@@ -431,28 +431,7 @@ def diversify_by_fach(scored_items, n_results):
     return selected[:n_results]
 
 
-def format_response(scored_items, n_results, query_profile):
-    top_items = diversify_by_fach(scored_items, n_results)
-    metadata_rows = []
-    for item in top_items:
-        competency_chain = lookup_competency_chain(item["id"])
-        metadata_rows.append({
-            **item["metadata"],
-            "_score": round(item["final_score"], 5),
-            "_match_sources": sorted(item["sources"]),
-            "_query_variant_hits": len(item["query_variants"]),
-            "_keyword_hits": len(item["keyword_hits"]),
-            "_query_profile": query_profile,
-            "_competency_chain": competency_chain,
-        })
-    return {
-        "documents": [[item["document"] for item in top_items]],
-        "metadatas": [metadata_rows],
-        "ids": [[item["id"] for item in top_items]],
-        "distances": [[item["best_distance"] if item["best_distance"] is not None else 1.0 for item in top_items]],
-    }
-
-# --- Kompetenz-Aufbaukette (Vorgänger / aktuell / Nachfolger) -----------------
+# --- Kompetenz-Aufbaukette (muss vor format_response stehen) -----------------
 
 LEHRPLAN_JSON_PATH = Path(
     os.getenv("LEHRPLAN_JSON_PATH", str(Path(__file__).resolve().parent / "Lehrplan21.json"))
@@ -492,6 +471,7 @@ def _load_lehrplan_rows():
         return _lehrplan_json_rows
 
     if not LEHRPLAN_JSON_PATH.is_file():
+        print(f"Aufbau-Kette: Lehrplan21.json fehlt unter {LEHRPLAN_JSON_PATH}")
         _lehrplan_json_rows = []
         return _lehrplan_json_rows
 
@@ -582,6 +562,27 @@ def lookup_competency_chain(uid):
     }
 
 
+def format_response(scored_items, n_results, query_profile):
+    top_items = diversify_by_fach(scored_items, n_results)
+    metadata_rows = []
+    for item in top_items:
+        competency_chain = lookup_competency_chain(str(item["id"]))
+        metadata_rows.append({
+            **item["metadata"],
+            "_score": round(item["final_score"], 5),
+            "_match_sources": sorted(item["sources"]),
+            "_query_variant_hits": len(item["query_variants"]),
+            "_keyword_hits": len(item["keyword_hits"]),
+            "_query_profile": query_profile,
+            "_competency_chain": competency_chain,
+        })
+    return {
+        "documents": [[item["document"] for item in top_items]],
+        "metadatas": [metadata_rows],
+        "ids": [[item["id"] for item in top_items]],
+        "distances": [[item["best_distance"] if item["best_distance"] is not None else 1.0 for item in top_items]],
+    }
+
 #------------------------------------------------------------App------------------------------------------------------------
 
 #App
@@ -606,10 +607,11 @@ def health():
 
 
 @app.route('/competency-chain/<uid>', methods=['GET'])
+@app.route('/api/competency-chain/<uid>', methods=['GET'])
 def competency_chain(uid):
     payload = lookup_competency_chain(uid)
     if payload is None:
-        return jsonify({"error": "not_found"}), 404
+        return jsonify({"error": "not_found", "uid": uid}), 404
     return jsonify(payload)
 
 
