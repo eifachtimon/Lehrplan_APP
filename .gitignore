@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 .cursor/
+deploy/proxmox/deploy.env
+backend/data/calendar_feeds/
+backend/chroma/

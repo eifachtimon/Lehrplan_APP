@@ -7,6 +7,7 @@ from flask_cors import CORS
 import re
 import os
 import json
+import unicodedata
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,6 +19,8 @@ from query_aliases import (
     expand_query_tokens,
     get_query_aliases_store,
 )
+from calendar_ics import fetch_subscription_events
+from calendar_feed import build_ics, load_feed_ics, new_export_token, publish_feed
 
 #------------------------------------------------------------ChromaDB------------------------------------------------------------
 # ChromaDB
@@ -287,6 +290,49 @@ def build_where_clause(filters):
 
 COMPETENCY_CODE_FRAGMENT_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)+")
 
+_CODE_SEGMENT_CHUNK_RE = re.compile(r"(\d+)|(\D+)")
+
+
+def _competency_code_segment_sort_key(segment):
+    """Sortierschlüssel für ein Code-Segment (z. B. 1a < 1b < 2a < 10a)."""
+    if segment is None:
+        return ()
+    seg = str(segment).strip().lower()
+    if not seg:
+        return ()
+    parts = []
+    for m in _CODE_SEGMENT_CHUNK_RE.finditer(seg):
+        digits, nondigits = m.group(1), m.group(2)
+        if digits is not None:
+            parts.append((0, int(digits)))
+        elif nondigits:
+            parts.append((1, nondigits.lower()))
+    return tuple(parts) if parts else ((1, seg),)
+
+
+def competency_code_sort_tuple(code):
+    """Tupel-Vergleich über alle mit '.' getrennten Segmente (offizielle Code-Reihenfolge)."""
+    if not code:
+        return ()
+    segments = [s for s in str(code).strip().lower().split(".") if s != ""]
+    return tuple(_competency_code_segment_sort_key(s) for s in segments)
+
+
+def metadata_competency_code(meta):
+    if not meta:
+        return ""
+    return str(meta.get("code") or meta.get("competency_code") or "").strip()
+
+
+def is_pure_competency_code_query(query_text, query_schlagwort):
+    """True, wenn die Anfrage nur aus einem Kompetenzcode-Fragment besteht (ohne Freitext)."""
+    combined = f"{query_text} {query_schlagwort}".strip()
+    if not combined:
+        return False
+    compact = re.sub(r"\s+", "", combined)
+    return bool(COMPETENCY_CODE_FRAGMENT_RE.fullmatch(compact))
+
+
 _competency_code_index_cache = None
 _COMPETENCY_CODE_INDEX_VERSION = 2
 
@@ -440,7 +486,7 @@ def resolve_uids_from_competency_code_candidates(candidates):
             continue
 
         matching_codes = [fc for fc in all_codes if fc.lower().startswith(ck)]
-        matching_codes.sort()
+        matching_codes.sort(key=competency_code_sort_tuple)
         if len(matching_codes) > 48:
             matching_codes = matching_codes[:48]
         for fc in matching_codes:
@@ -452,13 +498,17 @@ def resolve_uids_from_competency_code_candidates(candidates):
     return ordered_uids[:max_uids]
 
 
-def competency_code_lookup_retrieve(collection, query_text, query_schlagwort, filters, candidate_map):
+def competency_code_lookup_retrieve(
+    collection, query_text, query_schlagwort, filters, candidate_map, resolved_uids=None
+):
     combined = f"{query_text} {query_schlagwort}".strip()
-    candidates = extract_competency_code_candidates(combined)
-    if not candidates:
-        return
-
-    uids = resolve_uids_from_competency_code_candidates(candidates)
+    if resolved_uids is not None:
+        uids = list(resolved_uids)
+    else:
+        candidates = extract_competency_code_candidates(combined)
+        if not candidates:
+            return
+        uids = resolve_uids_from_competency_code_candidates(candidates)
     if not uids:
         return
 
@@ -833,6 +883,8 @@ _CHAIN_GROUP_ROWS_CACHE_EPOCH = 2
 _chain_group_rows_cache_epoch = 0
 _chain_group_rows_cache = {}
 _lehrplan_json_rows = None
+# Cache: (fach, kb_code) -> gemeinsamer NFC-Präfix der Themenbereiche unter diesem KB, oder None
+_TB_KB_LCP_CACHE = {}
 
 
 def _normalize_uid(uid):
@@ -840,6 +892,31 @@ def _normalize_uid(uid):
         return None
     text = str(uid).strip()
     return text if text else None
+
+
+def _uid_base_for_chain_match(uid):
+    """API-/URL-Suffixe (z. B. .u0) von der logischen Lehrplan-uid trennen."""
+    if uid is None:
+        return ""
+    text = str(uid).strip()
+    if not text:
+        return ""
+    return text.split(".")[0]
+
+
+def _uids_equivalent_for_chain(a, b):
+    """Zwei uid-Strings bezeichnen dieselbe Lehrplan-Zeile (inkl. Basis bei Suffix)."""
+    if a is None or b is None:
+        return False
+    sa = str(a).strip()
+    sb = str(b).strip()
+    if not sa or not sb:
+        return False
+    if sa == sb:
+        return True
+    ba = _uid_base_for_chain_match(sa)
+    bb = _uid_base_for_chain_match(sb)
+    return bool(ba and bb and ba == bb)
 
 
 def _format_chain_item(item):
@@ -861,19 +938,112 @@ def _format_chain_item(item):
     return out
 
 
+def _merge_adjacent_chain_steps_by_code(steps):
+    """
+    Aufeinanderfolgende Stufen mit gleichem Kompetenzcode (z. B. zwei Zeilen D.3.C.1.B)
+    zu einer Karte zusammenfassen: ein Code, mehrere Kompetenztexte.
+    """
+    if not steps:
+        return []
+    out = []
+    i = 0
+    n = len(steps)
+    while i < n:
+        step = steps[i]
+        code = str(step.get("code") or "").strip()
+        if not code:
+            out.append(dict(step))
+            i += 1
+            continue
+        run = [step]
+        j = i + 1
+        while j < n and str(steps[j].get("code") or "").strip() == code:
+            run.append(steps[j])
+            j += 1
+        if len(run) == 1:
+            out.append(dict(step))
+            i = j
+            continue
+        merged = dict(run[0])
+        texts_ordered = []
+        seen_text = set()
+        merged_uids = []
+        merged_doc_keys = []
+        link_out = []
+        seen_link_target = set()
+        for s in run:
+            t = str(s.get("text") or "").strip()
+            if t and t not in seen_text:
+                seen_text.add(t)
+                texts_ordered.append(t)
+            u = s.get("uid")
+            if u:
+                us = str(u).strip()
+                if us and us not in merged_uids:
+                    merged_uids.append(us)
+            dk = s.get("doc_key")
+            if dk:
+                dks = str(dk).strip()
+                if dks and dks not in merged_doc_keys:
+                    merged_doc_keys.append(dks)
+            for lk in s.get("network_links") or []:
+                if not isinstance(lk, dict):
+                    continue
+                tid = lk.get("uid")
+                if tid and str(tid) not in seen_link_target:
+                    seen_link_target.add(str(tid))
+                    link_out.append(lk)
+        merged["text"] = texts_ordered[0] if texts_ordered else merged.get("text")
+        if len(texts_ordered) > 1:
+            merged["text_variants"] = texts_ordered
+        merged["merged_uids"] = merged_uids
+        merged["merged_doc_keys"] = merged_doc_keys
+        if link_out:
+            merged["network_links"] = link_out
+        out.append(merged)
+        i = j
+    return out
+
+
+def _merged_chain_index_for_row(merged_steps, uid, doc_key):
+    """Index der zusammengeführten Karte, die die gegebene Stufe (uid/doc_key) enthält."""
+    uid_s = str(uid or "").strip()
+    dk_s = str(doc_key or "").strip()
+
+    def step_matches(m):
+        if dk_s and m.get("doc_key") and str(m["doc_key"]).strip() == dk_s:
+            return True
+        if uid_s and m.get("uid") and _uids_equivalent_for_chain(m.get("uid"), uid_s):
+            return True
+        for x in m.get("merged_doc_keys") or []:
+            if dk_s and str(x).strip() == dk_s:
+                return True
+        for x in m.get("merged_uids") or []:
+            if uid_s and _uids_equivalent_for_chain(x, uid_s):
+                return True
+        return False
+
+    for idx, m in enumerate(merged_steps):
+        if step_matches(m):
+            return idx
+    return None
+
+
 def _load_lehrplan_rows():
     """Rohe Zeilen aus Lehrplan21.json (optional Cache für Fallback)."""
-    global _lehrplan_json_rows
+    global _lehrplan_json_rows, _TB_KB_LCP_CACHE
     if _lehrplan_json_rows is not None:
         return _lehrplan_json_rows
 
     if not LEHRPLAN_JSON_PATH.is_file():
         print(f"Aufbau-Kette: Lehrplan21.json fehlt unter {LEHRPLAN_JSON_PATH}")
         _lehrplan_json_rows = []
+        _TB_KB_LCP_CACHE = {}
         return _lehrplan_json_rows
 
     with open(LEHRPLAN_JSON_PATH, encoding="utf-8") as json_file:
         _lehrplan_json_rows = json.load(json_file)
+    _TB_KB_LCP_CACHE = {}
 
     return _lehrplan_json_rows
 
@@ -1061,6 +1231,12 @@ def lookup_competency_chain(uid):
     if not raw:
         return None
 
+    if not raw.lower().startswith(LP21_ROW_PREFIX.lower()):
+        candidates = extract_competency_code_candidates(raw) or [raw]
+        resolved = resolve_uids_from_competency_code_candidates(candidates)
+        if resolved:
+            raw = resolved[0]
+
     json_data = _load_lehrplan_rows()
     row_index = parse_lp21_row_index(raw)
     target_row = None
@@ -1073,7 +1249,7 @@ def lookup_competency_chain(uid):
             for row in json_data:
                 if row.get("strukturtyp") != "Kompetenzstufe":
                     continue
-                if _normalize_uid(row.get("uid")) == raw:
+                if _uids_equivalent_for_chain(row.get("uid"), raw):
                     target_row = row
                     break
 
@@ -1097,16 +1273,35 @@ def lookup_competency_chain(uid):
                     if links:
                         item["network_links"] = links
                     full_formatted.append(item)
+                merged_chain = _merge_adjacent_chain_steps_by_code(full_formatted)
                 current_row = rows[pos]
                 current_links = _network_links_for_row(current_row)
                 heading = fetch_bs_chain_heading(_normalize_uid(target_row.get("uid")))
+                cur_uid = full_formatted[pos].get("uid")
+                cur_doc = full_formatted[pos].get("doc_key")
+                mpos = _merged_chain_index_for_row(merged_chain, cur_uid, cur_doc)
+                if mpos is None:
+                    mpos = 0
+                cur_merged = merged_chain[mpos]
+                cur_merged["uid"] = _normalize_uid(current_row.get("uid"))
+                try:
+                    ri_nav = json_data.index(current_row)
+                    cur_merged["doc_key"] = f"{LP21_ROW_PREFIX}{ri_nav}"
+                except ValueError:
+                    pass
+                cur_code = str(current_row.get("code") or "").strip()
+                tb_kb, tb_aspect = _themenbereich_kb_aspect_for_row(current_row, json_data)
+                cluster_c = _competenz_cluster_code(cur_code)
                 return {
-                    "previous": full_formatted[pos - 1] if pos > 0 else None,
-                    "current": full_formatted[pos],
-                    "next": full_formatted[pos + 1] if pos < len(full_formatted) - 1 else None,
-                    "full_chain": full_formatted,
+                    "previous": merged_chain[mpos - 1] if mpos > 0 else None,
+                    "current": cur_merged,
+                    "next": merged_chain[mpos + 1] if mpos < len(merged_chain) - 1 else None,
+                    "full_chain": merged_chain,
                     "_has_network": bool(current_links),
                     "chain_heading": heading,
+                    "themenbereich_kb": tb_kb or None,
+                    "themenbereich_aspect": tb_aspect or None,
+                    "cluster_code": cluster_c,
                 }
 
     return _minimal_chain_from_chroma(raw)
@@ -1185,15 +1380,163 @@ def _lp_themenbereich_prefix(code):
     return parts[0] if parts else None
 
 
+_KNOWN_MULTIWORD_KB_PREFIXES = (
+    # Mathematik (häufigster Fehlerfall)
+    "Grössen, Funktionen, Daten und Zufall",
+    "Zahl und Variable",
+    "Form und Raum",
+    # Weitere LP21-Mehrwort-Bezeichnungen (robuster für ähnliche Fälle)
+    "Ethik, Religionen, Gemeinschaft",
+    "Räume, Zeiten, Gesellschaften",
+    "Wirtschaft, Arbeit, Haushalt",
+    "Natur und Technik",
+    # NT Handlungsfeld (Lehrplan21.json, oft NFD — Vergleich über NFC)
+    "Mechanische und elektrische Phänomene untersuchen",
+    "Fortpflanzung und Entwicklung analysieren",
+    "Körperfunktionen verstehen",
+    "Wesen und Bedeutung von Naturwissenschaften und Technik verstehen",
+    "Medien und Informatik",
+    "Textiles und Technisches Gestalten",
+    "Bildnerisches Gestalten",
+    "Bewegung und Sport",
+    "Berufliche Orientierung",
+    "Praxis des musikalischen Wissens",
+)
+
+
 def _split_themenbereich_head(tb):
-    """Erstes Wort (z. B. Kompetenzbereich-Titel) und Rest (Aspekt-/Untertitel)."""
-    text = (tb or "").strip()
+    """
+    Trennt Themenbereich in Kompetenzbereich-Label und Rest.
+
+    Priorität:
+    1) bekannte mehrteilige LP21-Titel als Präfix erkennen (z. B. "Zahl und Variable")
+    2) sonst kompatibler Fallback: erstes Wort + Rest
+    """
+    text = unicodedata.normalize("NFC", (tb or "").strip())
     if not text:
         return "", ""
+
+    for prefix in _KNOWN_MULTIWORD_KB_PREFIXES:
+        pfx = unicodedata.normalize("NFC", prefix)
+        if text == pfx:
+            return text, ""
+        if text.startswith(pfx + " "):
+            return pfx, text[len(pfx) + 1 :].strip()
+
     idx = text.find(" ")
     if idx == -1:
         return text, ""
     return text[:idx].strip(), text[idx + 1 :].strip()
+
+
+def _kb_tb_nfc_list_for_fach_kb(fach, kb_code, json_data):
+    """Alle NFC-Themenbereich-Texte zu Kompetenzstufen unter fach + Codes kb_code.* (Reihenfolge stabil)."""
+    fach_k = (fach or "").strip()
+    kb_k = (kb_code or "").strip()
+    if not fach_k or not kb_k or not json_data:
+        return []
+    prefix = kb_k + "."
+    out = []
+    for r in json_data:
+        if str(r.get("strukturtyp") or "") != "Kompetenzstufe":
+            continue
+        if (r.get("fach") or "").strip() != fach_k:
+            continue
+        c = str(r.get("code") or "").strip()
+        if not c.startswith(prefix):
+            continue
+        tb = (r.get("themenbereich") or "").strip()
+        if tb:
+            out.append(unicodedata.normalize("NFC", tb))
+    return out
+
+
+def _kb_tb_lcp_raw(fach, kb_code, json_data):
+    """
+    Längster gemeinsamer Zeichen-Präfix aller Themenbereiche unter (fach, kb_code.*).
+
+    LP21 liefert oft KB-Titel und Aspekt-Titel in einem String ohne Trennzeichen
+    (z. B. „Bewegen und Tanzen Sensomotorische Schulung“). Unter demselben KB unterscheiden
+    sich die Aspekte nur im Suffix → der gemeinsame Präfix ist der KB-Titel inkl. Leerzeichen.
+    """
+    cache_key = (fach or "", kb_code or "")
+    if cache_key in _TB_KB_LCP_CACHE:
+        return _TB_KB_LCP_CACHE[cache_key]
+    tbs = _kb_tb_nfc_list_for_fach_kb(fach, kb_code, json_data)
+    uniq = list(dict.fromkeys(tbs))
+    if len(uniq) < 2:
+        _TB_KB_LCP_CACHE[cache_key] = None
+        return None
+    lcp_s = uniq[0]
+    for s in uniq[1:]:
+        i = 0
+        lim = min(len(lcp_s), len(s))
+        while i < lim and lcp_s[i] == s[i]:
+            i += 1
+        lcp_s = lcp_s[:i]
+    _TB_KB_LCP_CACHE[cache_key] = lcp_s if lcp_s else None
+    return _TB_KB_LCP_CACHE[cache_key]
+
+
+def _themenbereich_kb_aspect_for_row(row, json_data):
+    """
+    Zeile 1/2 im Kettenkopf: KB-Bezeichnung und Aspekt-Bezeichnung aus dem zusammengefügten themenbereich.
+
+    1) LCP über alle Themenbereiche desselben (fach, KB) (robust für Musik, Mathematik, …)
+    2) sonst _split_themenbereich_head (Mehrwort-Whitelist + erstes Wort)
+    """
+    tb = (row.get("themenbereich") or "").strip()
+    if not tb:
+        return "", ""
+    code = str(row.get("code") or "").strip()
+    parts = [p.strip() for p in code.split(".") if p.strip()]
+    if len(parts) < 2:
+        return _split_themenbereich_head(tb)
+    kb_key = ".".join(parts[:2])
+    fach = (row.get("fach") or "").strip()
+    tb_n = unicodedata.normalize("NFC", tb)
+    raw_lcp = _kb_tb_lcp_raw(fach, kb_key, json_data)
+    if raw_lcp and tb_n.startswith(raw_lcp):
+        asp = tb_n[len(raw_lcp) :].strip()
+        kb_label = raw_lcp.rstrip()
+        if asp:
+            return kb_label, asp
+    return _split_themenbereich_head(tb)
+
+
+def _longest_common_word_prefix(texts):
+    """Gemeinsamer Wort-Präfix über mehrere Themenbereich-Texte."""
+    cleaned = []
+    for t in texts or []:
+        s = unicodedata.normalize("NFC", (t or "").strip())
+        if s:
+            cleaned.append(s)
+    if not cleaned:
+        return ""
+    prefix = cleaned[0].split()
+    for txt in cleaned[1:]:
+        words = txt.split()
+        i = 0
+        limit = min(len(prefix), len(words))
+        while i < limit and prefix[i] == words[i]:
+            i += 1
+        prefix = prefix[:i]
+        if not prefix:
+            break
+    return " ".join(prefix).strip()
+
+
+def _strip_prefix_label(text, prefix):
+    """Entfernt einen exakten Präfix (falls vorhanden) und trimmt den Rest."""
+    s = unicodedata.normalize("NFC", (text or "").strip())
+    p = unicodedata.normalize("NFC", (prefix or "").strip())
+    if not s or not p:
+        return s
+    if s == p:
+        return ""
+    if s.startswith(p + " "):
+        return s[len(p) + 1 :].strip()
+    return s
 
 
 _NO_ASPECT_KEY = "__no_aspect__"
@@ -1270,7 +1613,6 @@ def build_curriculum_overview():
         aspect_key = ".".join(parts[:3]) if len(parts) >= 3 else _NO_ASPECT_KEY
 
         tb = (first.get("themenbereich") or "").strip()
-        fw, rest = _split_themenbereich_head(tb)
         heading = fetch_bs_chain_heading(uid)
         if not heading:
             heading = str(first.get("code") or "").strip() or uid
@@ -1296,8 +1638,7 @@ def build_curriculum_overview():
             "anchor_uid": uid,
             "cluster_code": cluster,
             "heading": heading,
-            "first_word": fw,
-            "rest_tb": rest,
+            "themenbereich": tb,
             "stages": stages,
         }
         bucket[fach_name][kb_key][aspect_key].append(chain_obj)
@@ -1320,15 +1661,30 @@ def build_curriculum_overview():
         kb_nodes = []
         for kb_key in sorted(kb_map.keys(), key=lambda x: (x.lower(), x)):
             aspect_map = kb_map[kb_key]
-            kb_label = ""
+            all_tb = []
             for ak in sorted(aspect_map.keys(), key=_aspect_sort_key):
                 for ch in aspect_map[ak]:
-                    fw = ch.get("first_word") or ""
-                    if fw:
-                        kb_label = fw
-                        break
-                if kb_label:
-                    break
+                    tbs = (ch.get("themenbereich") or "").strip()
+                    if tbs:
+                        all_tb.append(tbs)
+            has_aspects = any(k != _NO_ASPECT_KEY for k in aspect_map.keys())
+            kb_label = ""
+            if has_aspects:
+                raw_lcp = _kb_tb_lcp_raw(fach_name, kb_key, json_data)
+                if raw_lcp and raw_lcp.strip():
+                    kb_label = raw_lcp.rstrip()
+                else:
+                    kb_label = _longest_common_word_prefix(all_tb)
+                    if len(kb_label.split()) < 2:
+                        # Fallback: bekannte LP21-Mehrwort-Prefixes / altes Verhalten.
+                        for tb_txt in all_tb:
+                            fw, _ = _split_themenbereich_head(tb_txt)
+                            if fw:
+                                kb_label = fw
+                                break
+            else:
+                # Ohne Aspekte ist der Themenbereich selbst i. d. R. der KB-Titel.
+                kb_label = all_tb[0] if all_tb else ""
             if not kb_label:
                 kb_label = kb_key
 
@@ -1356,7 +1712,29 @@ def build_curriculum_overview():
                         }
                     )
                 else:
-                    aspect_label = (chain_list[0].get("rest_tb") or "").strip() if chain_list else ""
+                    aspect_label = ""
+                    if chain_list:
+                        for ch in chain_list:
+                            tb_full = (ch.get("themenbereich") or "").strip()
+                            if not tb_full:
+                                continue
+                            candidate = _strip_prefix_label(tb_full, kb_label)
+                            if candidate:
+                                aspect_label = candidate
+                                break
+                    if not aspect_label and chain_list:
+                        first_tb = (chain_list[0].get("themenbereich") or "").strip()
+                        kb_cmp = unicodedata.normalize("NFC", (kb_label or "").strip())
+                        tb_cmp = unicodedata.normalize("NFC", first_tb)
+                        rest_from_strip = _strip_prefix_label(first_tb, kb_label)
+                        if rest_from_strip:
+                            aspect_label = rest_from_strip
+                        elif tb_cmp == kb_cmp:
+                            # Gleicher Themenbereich für alle Aspekte unter diesem KB → kein Rest-Label
+                            aspect_label = ""
+                        else:
+                            _fw, rest = _split_themenbereich_head(first_tb)
+                            aspect_label = rest
                     aspect_nodes.append(
                         {
                             "aspect_code": aspect_key,
@@ -1532,6 +1910,62 @@ def infer_primary_match_channel(sources):
     return "vector"
 
 
+def merge_search_candidate_group(primary, secondary):
+    """
+    Zwei Treffer mit gleichem Kompetenzcode: besseres Ranking (primary) behalten,
+    Kompetenztexte und Ranking-Signale sinnvoll zusammenführen.
+    """
+    doc_p = (primary.get("document") or "").strip()
+    doc_s = (secondary.get("document") or "").strip()
+    if doc_s and doc_s not in doc_p:
+        doc_p = f"{doc_p}\n\n{doc_s}" if doc_p else doc_s
+    best_a = primary.get("best_distance")
+    best_b = secondary.get("best_distance")
+    best = best_a
+    if best_b is not None and (best is None or best_b < best):
+        best = best_b
+    fs = max(float(primary.get("final_score") or 0), float(secondary.get("final_score") or 0))
+    merged = dict(primary)
+    merged["document"] = doc_p
+    merged["best_distance"] = best
+    merged["final_score"] = fs
+    merged["sources"] = set(primary.get("sources") or set()) | set(secondary.get("sources") or set())
+    merged["keyword_hits"] = set(primary.get("keyword_hits") or set()) | set(
+        secondary.get("keyword_hits") or set()
+    )
+    merged["query_variants"] = set(primary.get("query_variants") or set()) | set(
+        secondary.get("query_variants") or set()
+    )
+    merged["rrf_score"] = max(
+        float(primary.get("rrf_score") or 0), float(secondary.get("rrf_score") or 0)
+    )
+    return merged
+
+
+def dedupe_top_items_by_competency_code(top_items):
+    """
+    Such-Treffer mit identischem metadata.code zu einem Eintrag zusammenführen
+    (Reihenfolge = Ranking; erster Treffer ist Träger der stabilen lp21:id).
+    """
+    if not top_items:
+        return []
+    out = []
+    code_to_out_idx = {}
+    for item in top_items:
+        meta = item.get("metadata") or {}
+        code = str(meta.get("code") or "").strip()
+        if not code:
+            out.append(item)
+            continue
+        if code not in code_to_out_idx:
+            code_to_out_idx[code] = len(out)
+            out.append(item)
+            continue
+        idx = code_to_out_idx[code]
+        out[idx] = merge_search_candidate_group(out[idx], item)
+    return out
+
+
 def format_response(top_items, query_profile):
     metadata_rows = []
     for rank_idx, item in enumerate(top_items, start=1):
@@ -1606,6 +2040,64 @@ def curriculum_overview():
         return jsonify({"subjects": [], "error": "build_failed"}), 500
 
 
+@app.route('/api/calendar/publish', methods=['POST'])
+def calendar_publish():
+    """Planungstermine für Apple-Kalender-Abo bereitstellen."""
+    data = request.json or {}
+    token = (data.get("token") or "").strip()
+    events = data.get("events") or []
+    if not token:
+        token = new_export_token()
+    if not isinstance(events, list):
+        return jsonify({"ok": False, "error": "events muss eine Liste sein"}), 400
+    try:
+        publish_feed(token, events)
+        return jsonify({"ok": True, "token": token, "count": len(events)})
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.route('/api/calendar/export', methods=['POST'])
+def calendar_export():
+    """Einmaliger .ics-Download (Import in Apple Kalender)."""
+    data = request.json or {}
+    events = data.get("events") or []
+    if not isinstance(events, list):
+        return jsonify({"ok": False, "error": "events muss eine Liste sein"}), 400
+    body = build_ics(events)
+    from flask import Response
+
+    return Response(
+        body,
+        mimetype="text/calendar; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="lehrplan-planung.ics"'},
+    )
+
+
+@app.route('/api/calendar/feed/<token>.ics', methods=['GET'])
+def calendar_feed(token):
+    """Abonnement-URL für Apple Kalender (webcal://…)."""
+    body = load_feed_ics(token)
+    if body is None:
+        return jsonify({"error": "Feed nicht gefunden — zuerst in der App synchronisieren."}), 404
+    from flask import Response
+
+    return Response(body, mimetype="text/calendar; charset=utf-8")
+
+
+@app.route('/api/calendar/fetch', methods=['POST'])
+def calendar_fetch():
+    """Proxy für externe .ics-Abos (Schulkalender etc.) — umgeht Browser-CORS."""
+    data = request.json or {}
+    url = (data.get("url") or "").strip()
+    subscription_id = (data.get("subscriptionId") or "sub").strip()[:64]
+    if not url:
+        return jsonify({"ok": False, "error": "url fehlt", "events": []}), 400
+    payload = fetch_subscription_events(url, subscription_id)
+    status = 200 if payload.get("ok") else 422
+    return jsonify(payload), status
+
+
 @app.route('/search', methods=['POST'])
 def search():
     collection = init_collection()
@@ -1640,10 +2132,19 @@ def search():
     exact_scope = resolve_exact_competency_codes_in_query(query_text, query_schlagwort)
     exact_competency_code = bool(exact_scope["codes_lower"])
 
-    candidate_map = {}
-    competency_code_lookup_retrieve(collection, query_text, query_schlagwort, filters, candidate_map)
+    code_candidates = extract_competency_code_candidates(combined_for_tokens)
+    code_lookup_uids = resolve_uids_from_competency_code_candidates(code_candidates)
+    pure_code_query = is_pure_competency_code_query(query_text, query_schlagwort)
+    skip_parallel_for_code = (
+        pure_code_query and bool(code_lookup_uids) and not exact_competency_code
+    )
 
-    if not exact_competency_code:
+    candidate_map = {}
+    competency_code_lookup_retrieve(
+        collection, query_text, query_schlagwort, filters, candidate_map, resolved_uids=code_lookup_uids
+    )
+
+    if not exact_competency_code and not skip_parallel_for_code:
         parallel_candidates = parallel_retrieve_all(
             collection, query_variants, semantic_variants, where_clause, n_results, weights
         )
@@ -1668,11 +2169,25 @@ def search():
             for item in scored_items
             if item["id"] in allowed_uids and metadata_matches_request_filters(item["metadata"], filters)
         ]
+        scored_items.sort(
+            key=lambda it: competency_code_sort_tuple(metadata_competency_code(it.get("metadata")))
+        )
+        top_items = scored_items[: min(len(scored_items), 50)]
+    elif skip_parallel_for_code:
+        scored_items = [
+            item
+            for item in scored_items
+            if metadata_matches_request_filters(item["metadata"], filters)
+        ]
+        scored_items.sort(
+            key=lambda it: competency_code_sort_tuple(metadata_competency_code(it.get("metadata")))
+        )
         top_items = scored_items[: min(len(scored_items), 50)]
     else:
         scored_items = apply_second_stage_rerank(scored_items, combined_query)
         top_items = mmr_diversify(scored_items, n_results)
 
+    top_items = dedupe_top_items_by_competency_code(top_items)
     response = format_response(top_items, query_profile)
     response["meta"] = {
         "n_results_used": n_results,

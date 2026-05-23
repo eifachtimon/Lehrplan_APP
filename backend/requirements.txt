@@ -4,3 +4,4 @@ chromadb
 torch
 transformers
 gunicorn
+icalendar
