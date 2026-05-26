@@ -4,7 +4,7 @@ Stand: Mai 2026
 
 ## Begriffe in der Oberfläche
 
-- In der UI heißen Planungseinheiten **Thema / Themen** (früher «Vorhaben»).
+- In der UI heißen Planungseinheiten **Thema / Themen** (früher «Vorhaben»); in der **Sidebar** sind sie unter **Fächern** gruppiert (Sektion «Fächer», darunter die Themen-Zeilen).
 - Technische IDs, Routen und Store-Felder bleiben vorerst `vorhaben` (z. B. `/planung/vorhaben/:id`).
 
 ## Mein Unterricht (Hub)

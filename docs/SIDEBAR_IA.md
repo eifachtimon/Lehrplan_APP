@@ -35,13 +35,11 @@ Die Lehrperson denkt in **Bibliothek** (gesammelte Kompetenzen) und **Vorhaben**
 │  Monat       │                                                        │
 │  Kalender    │                                                        │
 ├──────────────┤                                                        │
-│ VORHABEN  [+]│                                                        │
-│  ▼ Bruchteile│  ← aktiv, Drop-Zone                                    │
-│    Grob      │                                                        │
-│    2 Wochen  │                                                        │
-│    Woche     │                                                        │
-│    Lektion   │                                                        │
-│  ▶ Lesen     │                                                        │
+│ FÄCHER    [+]│  ← Sektion: Fach-Ordner, darunter Themen               │
+│  ▼ Mathematik│                                                        │
+│    · Brüche… │  ← Thema (Planungseinheit), Drop-Zone                  │
+│  ▶ Deutsch   │                                                        │
+│    · Lesen   │                                                        │
 ├──────────────┤                                                        │
 │ BIBLIOTHEK   │                                                        │
 │  ▼ Gemerkt   │                                                        │
@@ -81,28 +79,26 @@ Breite: **280px** offen, **56px** eingeklappt (nur Icons + Badges).
 
 Aktiver Eintrag = Hintergrund + linker Balken (Bauhaus-Gelb).
 
-### 3. Vorhaben (Kern — Baum)
+### 3. Fächer (Kern — Baum)
 
-Jedes Vorhaben = **Ordner** mit 4 **Ebenen** als Kinder:
+**Hierarchie:** Oben **Fach** (Mathematik, Deutsch, …), darunter **Themen** (Planungseinheiten, Code: `vorhaben`). Die Sidebar-Sektion heisst **Fächer** — nicht «Themen» auf oberster Ebene.
 
 ```text
-▼ Bruchteile im Alltag     [3]   ← Badge: offene Meilensteine / Kompetenzen
-  · Grob
-  · 2 Wochen
-  · Woche
-  · Lektion
+▼ Mathematik (2)           ← Fach-Ordner
+  · Brüche im Alltag [3]   ← Thema, Badge = Meilensteine
+  · Prozentrechnen
+▶ Deutsch (1)
 ```
 
-- **Klick** auf Titel → letzte besuchte Ebene (`lastVisitedLevel`)
-- **Klick** auf Ebene → `vorhabenLevelPath(id, level)`
+- **Klick** auf Thema-Titel → Themen-Übersicht (`vorhabenLevelPath`, Ebene `uebersicht`)
 - **Aktiv** = Route match + gelber Streifen
-- **`[+]`** → neues Vorhaben (Vorlage wählen im Hub oder Mini-Dialog)
+- **`[+]`** → neues **Thema** (erscheint unter dem gewählten Fach)
 
-**Drop-Zone:** Gesamter Vorhaben-Knoten + optional jede Ebene:
+**Drop-Zone:** Thema-Zeile unter einem Fach:
 
 | Drop | Wirkung |
 |------|---------|
-| Kompetenz auf Vorhaben | `addCompetencyToVorhaben` (wie heute «Ins Vorhaben») |
+| Kompetenz auf Thema | `addCompetencyToVorhaben` (wie heute «Ins Thema») |
 | Kompetenz auf «Lektion» | Kompetenz + optional Navigation zu Lektion |
 | (später) Ritual auf «Woche» | wie Ritual-Palette im Panel |
 
@@ -115,7 +111,7 @@ Bestehende `competencyBookmarks.js`-Ordner **1:1** übernehmen:
 - Ordner auf-/zuklappbar (wie heute im Drawer)
 - Kompetenz-Zeilen **drag handle** links (HTML5 DnD, bereits in `App.js`)
 - Drag **zwischen Ordnern** = bestehende Logik
-- Drag **auf Vorhaben** = neue Brücke zu `planningCompetencies`
+- Drag **auf Thema** (unter Fach) = neue Brücke zu `planningCompetencies`
 
 **Kein zweites «Merkliste»-Konzept** — nur anderer Container (Sidebar statt Overlay).
 
@@ -141,7 +137,7 @@ flowchart LR
     MAIN[Hauptbereich]
   end
   SB --> NAV[Router Links]
-  SB --> TREE[Vorhaben-Baum]
+  SB --> TREE[Fächer-Themen-Baum]
   SB --> BIB[BookmarkStore]
   MAIN --> LOC[PlanningLocationBar]
   MAIN --> PAGE[Seiteninhalt]
@@ -201,7 +197,7 @@ Kein neues npm-Paket nötig für MVP (native DnD). `@dnd-kit` nur wenn Multi-Lis
 
 | Quelle | Speicher | Sidebar-Sektion |
 |--------|----------|-----------------|
-| `planningStore.vorhaben` | `lp21-planning-v1` | Vorhaben-Baum |
+| `planningStore.vorhaben` | `lp21-planning-v1` | Fächer → Themen (gruppiert per `groupVorhabenByFach`) |
 | `bookmarkStore.folders` | `lp21-competency-bookmarks-v2` | Bibliothek |
 | Router | — | Aktive Markierung |
 | `lastActiveVorhabenId` | planning store | Vorhaben oben sortieren / hervorheben |
@@ -215,7 +211,7 @@ Kein neues npm-Paket nötig für MVP (native DnD). `@dnd-kit` nur wenn Multi-Lis
 | Phase | Inhalt | Nutzen |
 |-------|--------|--------|
 | **A** | `AppShell` + Sidebar-Gruppen 1–2 (Nav + Zeit), Router-Sync | Navigation ohne FAB-Chaos |
-| **B** | Vorhaben-Baum, Klick → Routen, `[+]` | Überblick + 1-Klick-Ebenen |
+| **B** | Fächer-Themen-Baum, Klick → Routen, `[+]` | Überblick + 1-Klick in Thema |
 | **C** | Bibliothek aus Drawer in Sidebar, Ordner-DnD | Merkliste immer sichtbar (Desktop) |
 | **D** | DnD Kompetenz → Vorhaben | Kern-Mehrwert «wie Ordner» |
 | **E** | Mobile Overlay + Badges/Heute-Fuss | Vollständig nutzbar |
@@ -227,7 +223,7 @@ Geschätzter Ort im Code: `frontend/src/shell/AppSidebar.js`, `AppShellLayout.js
 ## UX-Regeln (damit es nicht überladet)
 
 1. **Max. 5 sichtbare Gruppen** — mit `details`/Akkordeon pro Gruppe
-2. **Vorhaben-Baum**: standardmässig nur **aktives** + **zuletzt 2** aufgeklappt
+2. **Fächer-Baum**: Fach-Ordner standardmässig aufgeklappt wenn ≤3 Themen; aktives Thema hervorgehoben
 3. **Bibliothek**: max. 8 sichtbare Items pro Ordner, Rest «+ N weitere»
 4. **Keine Metadaten** in der Zeile (nur Code + 1 Zeile Label)
 5. **DnD ist Zusatz** — jeder Drop hat Äquivalent per Klick (Kontextmenü «Zu Vorhaben …»)
